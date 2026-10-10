@@ -1319,7 +1319,8 @@ function renderTranslationJobs() {
             if (job.mesId >= 0) {
                 const $text = $(`#chat .mes[mesid="${job.mesId}"] .mes_text`);
                 if (!$text.length) continue;
-                $text.after($row);
+                // Place progress below the message toolbar and above the passage.
+                $text.before($row);
             } else $('#icb_jobs').append($row);
         }
         const state = { running: '번역 중', failed: '번역 실패', cancelled: '번역 취소' }[job.status];
