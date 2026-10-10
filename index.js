@@ -1102,19 +1102,57 @@ function splitTranslationChunks(text, maxChars = 4000, maxParagraphs = 12) {
     return chunks;
 }
 
+// Bound actual API requests too: paragraph fallbacks can nest inside chunk workers.
+const TRANSLATION_CONCURRENCY = 3;
+let activeTranslationRequests = 0;
+const translationRequestQueue = [];
+
+async function withTranslationSlot(task) {
+    if (activeTranslationRequests >= TRANSLATION_CONCURRENCY) {
+        await new Promise(resolve => translationRequestQueue.push(resolve));
+    } else {
+        activeTranslationRequests++;
+    }
+    try {
+        return await task();
+    } finally {
+        const next = translationRequestQueue.shift();
+        if (next) next(); // Transfer this slot directly to the next request.
+        else activeTranslationRequests--;
+    }
+}
+
+async function mapTranslationParts(parts, translate) {
+    const results = new Array(parts.length);
+    let cursor = 0;
+    let failed = false;
+    const worker = async () => {
+        while (!failed && cursor < parts.length) {
+            const index = cursor++;
+            try {
+                results[index] = await translate(parts[index]);
+            } catch (error) {
+                failed = true;
+                throw error;
+            }
+        }
+    };
+    await Promise.all(Array.from({ length: Math.min(TRANSLATION_CONCURRENCY, parts.length) }, worker));
+    return results;
+}
+
 /** LLM 한 번 호출 + 봉인·품질 검증 재시도 */
 async function llmTranslate(sys, sealedChunk, srcCode, dstCode, vault, { contextLines = [], ownerChatId = null } = {}) {
     const s = getSettings();
     const chunks = splitTranslationChunks(sealedChunk);
     if (chunks.length > 1) {
-        const results = [];
-        for (const chunk of chunks) {
+        const results = await mapTranslationParts(chunks, async chunk => {
             const [, before, body, after] = chunk.match(/^(\s*)([\s\S]*?)(\s*)$/);
             const translated = hasTranslatable(body)
                 ? await llmTranslate(sys, body, srcCode, dstCode, vault, { contextLines, ownerChatId })
                 : body;
-            results.push(before + translated + after);
-        }
+            return before + translated + after;
+        });
         return results.join('');
     }
     const sealsIn = [...sealedChunk.matchAll(SEAL_RX)].map(m => Number(m[1]));
@@ -1125,7 +1163,7 @@ async function llmTranslate(sys, sealedChunk, srcCode, dstCode, vault, { context
         const user = buildUserPrompt(sealedChunk, srcCode, dstCode, { contextLines, extraNote, ownerChatId });
         bumpStats('calls');
         bumpStats('chars', sealedChunk.length);
-        const raw = await callTranslator(sys, user);
+        const raw = await withTranslationSlot(() => callTranslator(sys, user));
         return tidyOutput(raw, sealedChunk);
     };
 
@@ -1151,14 +1189,13 @@ async function llmTranslate(sys, sealedChunk, srcCode, dstCode, vault, { context
     // A model may collapse blank lines despite preserving the actual text.
     // Retry each paragraph separately instead of rejecting the entire message.
     if (invalid?.startsWith('paragraph structure mismatch')) {
-        const results = [];
-        for (const block of splitBlocks(sealedChunk)) {
+        const results = await mapTranslationParts(splitBlocks(sealedChunk), async block => {
             const [, before, body, after] = block.text.match(/^(\s*)([\s\S]*?)(\s*)$/);
             const translated = hasTranslatable(body)
                 ? await llmTranslate(sys, body, srcCode, dstCode, vault, { contextLines, ownerChatId })
                 : body;
-            results.push(before + translated + after + block.sep);
-        }
+            return before + translated + after + block.sep;
+        });
         return results.join('');
     }
 

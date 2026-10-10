@@ -64,3 +64,37 @@ test('single-spaced long code is split on line boundaries and seals remain atomi
     assert.equal(chunks[0].slice(0, 9), '<seal-0/>');
     assert.ok(chunks.at(-1).endsWith('<seal-1/>'));
 });
+
+test('chunks run concurrently, keep output order, and cap nested fallbacks at three requests', async () => {
+    let active = 0;
+    let peak = 0;
+    const { context } = harness(async text => {
+        active++;
+        peak = Math.max(peak, active);
+        const number = Number(text.match(/Hello (\d+)/)[1]);
+        await new Promise(resolve => setTimeout(resolve, number % 3 === 0 ? 12 : 1));
+        active--;
+        return text.replaceAll('Hello', '안녕').replace(/\n{2,}/g, '\n');
+    });
+    const text = Array.from({ length: 40 }, (_, n) => `Hello ${n}: ${'A story sentence. '.repeat(8)}`).join('\n\n');
+    const results = await Promise.all([
+        context.llmTranslate('', text, 'en', 'ko', []),
+        context.llmTranslate('', text, 'en', 'ko', []),
+    ]);
+    assert.equal(peak, 3);
+    assert.equal(active, 0);
+    for (const result of results) assert.equal(result, text.replaceAll('Hello', '안녕'));
+});
+
+test('request slots are released after API rejection and queued work can finish', async () => {
+    const { context } = harness();
+    const failure = new Error('API failure');
+    const tasks = Array.from({ length: 8 }, (_, n) => context.withTranslationSlot(async () => {
+        if (n < 3) throw failure;
+        return n;
+    }));
+    const results = await Promise.allSettled(tasks);
+    assert.equal(results.filter(result => result.status === 'rejected').length, 3);
+    assert.deepEqual(results.slice(3).map(result => result.value), [3, 4, 5, 6, 7]);
+    assert.equal(await context.withTranslationSlot(async () => 'ready'), 'ready');
+});
