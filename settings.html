@@ -1,12 +1,13 @@
 <div id="icb_settings" class="icb">
     <div class="inline-drawer">
         <div class="inline-drawer-toggle inline-drawer-header">
-            <b><i class="fa-solid fa-earth-asia"></i> Interpres Codeblocks — 이야기 통역사 <span class="icb__version">v1.0.2</span></b>
+            <b><i class="fa-solid fa-earth-asia"></i> Interpres Custom <span class="icb__version">v 1.0.3</span></b>
             <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
         </div>
         <div class="inline-drawer-content">
+            <div id="icb_jobs"></div>
 
-            <div class="icb__tabs" role="tablist" aria-label="Interpres Codeblocks 설정">
+            <div class="icb__tabs" role="tablist" aria-label="Interpres Custom 설정">
                 <button class="icb__tab is-active" type="button" data-tab="basic">
                     <i class="fa-solid fa-language"></i><span>기본</span>
                 </button>
@@ -28,7 +29,7 @@
             <section class="icb__panel is-active" data-panel="basic">
                 <label class="checkbox_label">
                     <input type="checkbox" id="icb_enabled">
-                    <span>Interpres Codeblocks 사용</span>
+                    <span>Interpres Custom 사용</span>
                 </label>
                 <div class="icb__grid2">
                     <div class="icb__field">
@@ -334,6 +335,8 @@
                 </div>
                 <div class="icb__field">
                     <label>이 채팅의 번역 통계</label>
+                    <div id="icb_batch_progress" role="status" aria-live="polite"></div>
+                    <button type="button" class="menu_button" id="icb_batch_cancel" style="display: none">일괄 번역 취소</button>
                     <div id="icb_stats" class="icb__stats">—</div>
                 </div>
                 <div class="icb__hint">

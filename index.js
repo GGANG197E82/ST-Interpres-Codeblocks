@@ -3,7 +3,7 @@
 /// <reference types="toastr" />
 
 /**
- * Interpres Codeblocks — 이야기 통역사 (SillyTavern Extension)
+ * Interpres Custom (SillyTavern Extension)
  *
  * 롤플레잉에 특화된 LLM 번역 확장.
  * - 원문은 그대로 모델에게 전달되고, 화면에만 번역이 표시됩니다 (ST 네이티브 display_text 방식).
@@ -34,6 +34,7 @@ import { SlashCommand } from "../../../slash-commands/SlashCommand.js";
 import { ARGUMENT_TYPE, SlashCommandArgument } from "../../../slash-commands/SlashCommandArgument.js";
 import { MAX_BOOK_BYTES, parseBook, exportBook, mergeBook } from './book-transfer.mjs';
 import { requestReverseProxy } from './reverse-proxy.mjs';
+import { TranslationJob } from './translation-job.mjs';
 
 const MODULE_NAME = 'interpres_codeblocks';
 const PROMPT_REV = 2;
@@ -241,7 +242,7 @@ function downloadBook() {
         link.click();
         link.remove();
         setTimeout(() => URL.revokeObjectURL(url), 1000);
-        toastr.success(`${result.count}개 내보내기${result.skipped ? ` (미완성·중복 ${result.skipped}개 제외)` : ''}`, 'Interpres Codeblocks');
+        toastr.success(`${result.count}개 내보내기${result.skipped ? ` (미완성·중복 ${result.skipped}개 제외)` : ''}`, 'Interpres Custom');
     } catch (e) { toastr.error(String(e.message || e), '내보내기 실패'); }
 }
 
@@ -346,7 +347,7 @@ async function importCarry() {
     await persistBook();
     renderGlossary();
     renderVoiceCards();
-    toastr.success(`용어 ${ng}개 · 말투 카드 ${nv}개를 이 챗방으로 가져왔습니다. (중복 제외)`, 'Interpres Codeblocks');
+    toastr.success(`용어 ${ng}개 · 말투 카드 ${nv}개를 이 챗방으로 가져왔습니다. (중복 제외)`, 'Interpres Custom');
 }
 
 /** 격리된 목록을 버린다. 전역 잔재는 확인 후 완전히 지워 다시는 뜨지 않게 한다 */
@@ -371,7 +372,7 @@ async function dropCarry() {
     await persistBook();
     renderGlossary();
     renderVoiceCards();
-    toastr.info('격리된 목록을 버렸습니다.', 'Interpres Codeblocks');
+    toastr.info('격리된 목록을 버렸습니다.', 'Interpres Custom');
 }
 
 function persistStore() {
@@ -661,7 +662,7 @@ function prefillTurns(use = true) {
     return p.trim() ? [{ role: 'assistant', content: p }] : [];
 }
 
-async function callDirectApi(systemPrompt, userPrompt, tokens, usePrefill = true) {
+async function callDirectApi(systemPrompt, userPrompt, tokens, usePrefill = true, signal) {
     const cfg = getSettings().customApi;
     const url = normalizeApiUrl(cfg.url);
     if (!url || !cfg.model) throw new Error('커스텀 API의 URL과 모델을 설정하세요');
@@ -671,6 +672,9 @@ async function callDirectApi(systemPrompt, userPrompt, tokens, usePrefill = true
 
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), Math.max(10, cfg.timeoutSec || 120) * 1000);
+    const onAbort = () => controller.abort();
+    signal?.addEventListener('abort', onAbort, { once: true });
+    if (signal?.aborted) controller.abort();
     try {
         const response = await fetch(url, {
             method: 'POST',
@@ -710,8 +714,14 @@ async function callDirectApi(systemPrompt, userPrompt, tokens, usePrefill = true
             throw new Error(`모델이 빈 응답을 돌려줬습니다 (finish_reason: ${data.choices?.[0]?.finish_reason ?? '없음'}).${why}`);
         }
         return String(content);
+    } catch (e) {
+        if (e.name === 'AbortError' && !signal?.aborted) {
+            throw new Error('커스텀 API 응답 대기 시간이 초과되었습니다. 잠시 후 다시 시도하세요.');
+        }
+        throw e;
     } finally {
         clearTimeout(timeoutId);
+        signal?.removeEventListener('abort', onAbort);
     }
 }
 
@@ -719,19 +729,19 @@ async function callDirectApi(systemPrompt, userPrompt, tokens, usePrefill = true
  * 번역용 LLM 호출. 메인 생성 파이프라인을 점유하지 않아
  * 번역이 도는 중에도 채팅을 계속할 수 있다.
  */
-async function callTranslator(systemPrompt, userPrompt, { maxTokens, usePrefill = true } = {}) {
+async function callTranslator(systemPrompt, userPrompt, { maxTokens, usePrefill = true, signal } = {}) {
     const settings = getSettings();
     const tokens = maxTokens || settings.responseTokens;
 
     if (settings.apiMode === 'proxy') {
         return await requestReverseProxy(
             settings.reverseProxy, systemPrompt, userPrompt, tokens,
-            usePrefill ? String(settings.prefill || '') : '', getRequestHeaders(),
+            usePrefill ? String(settings.prefill || '') : '', getRequestHeaders(), undefined, signal,
         );
     }
 
     if (settings.apiMode === 'custom') {
-        return await callDirectApi(systemPrompt, userPrompt, tokens, usePrefill);
+        return await callDirectApi(systemPrompt, userPrompt, tokens, usePrefill, signal);
     }
 
     if (settings.apiMode === 'profile' && settings.profileId) {
@@ -941,7 +951,7 @@ function bumpStats(field, amount = 1) {
  * 핵심 번역 함수.
  * 1) 봉인 → 2) 메시지 전체 캐시 → 3) 문단 캐시로 부분 재사용 → 4) LLM 호출 → 5) 복원·검증
  */
-async function translateText(rawText, srcCode, dstCode, { mesId = -1, fresh = false } = {}) {
+async function translateText(rawText, srcCode, dstCode, { mesId = -1, fresh = false, resume = false, job = null } = {}) {
     const s = getSettings();
     const text = String(rawText ?? '');
     if (!text.trim()) return text;
@@ -955,6 +965,34 @@ async function translateText(rawText, srcCode, dstCode, { mesId = -1, fresh = fa
     const store = getStore();
     const fp = settingsFingerprint();
     const wholeKey = cacheKey(sealed, srcCode, dstCode, fp);
+    const contextLines = mesId >= 0 ? collectContextLines(mesId, dstCode) : [];
+    const sys = buildSystemPrompt(srcCode, dstCode);
+    if (job) {
+        job.check();
+        // Include source, seals, prompt and provider identity; never store API keys here.
+        const signature = JSON.stringify([sealed, vault, srcCode, dstCode, sys, contextLines,
+            s.apiMode, s.profileId, s.customApi?.url, s.customApi?.model,
+            s.reverseProxy?.url, s.reverseProxy?.model, s.prefill]);
+        const key = String(getStringHash(signature));
+        store.partials ||= {};
+        if ((fresh && !resume) || store.partials[key]?.signature !== signature) {
+            store.partials[key] = { signature, parts: {}, ts: Date.now() };
+        }
+        const checkpoint = store.partials[key];
+        job.cleanups.push(() => {
+            if (store.partials[key] === checkpoint) delete store.partials[key];
+            if (currentChatId() === ownerChatId && getStore() === store) persistStore();
+        });
+        job.cache = checkpoint.parts;
+        job.fallbacks = checkpoint.fallbacks ||= {};
+        job.save = () => {
+            checkpoint.ts = Date.now();
+            if (currentChatId() === ownerChatId && getStore() === store) persistStore();
+        };
+        for (const old of Object.keys(store.partials).sort((a, b) => store.partials[b].ts - store.partials[a].ts).slice(10)) {
+            delete store.partials[old];
+        }
+    }
 
     // 메시지 전체 캐시 (재번역 시에는 건너뛴다)
     if (s.cacheEnabled && !fresh && store.wholes[wholeKey]) {
@@ -985,9 +1023,6 @@ async function translateText(rawText, srcCode, dstCode, { mesId = -1, fresh = fa
     });
     const missingIdx = blocks.map((b, i) => (hasTranslatable(b.text) && cached[i] === null) ? i : -1).filter(i => i >= 0);
 
-    const contextLines = mesId >= 0 ? collectContextLines(mesId, dstCode) : [];
-    const sys = buildSystemPrompt(srcCode, dstCode);
-
     let sealedResult;
 
     if (missingIdx.length === 0) {
@@ -996,7 +1031,15 @@ async function translateText(rawText, srcCode, dstCode, { mesId = -1, fresh = fa
         sealedResult = blocks.map((b, i) => (cached[i] ?? b.text) + b.sep).join('');
     } else if (missingIdx.length >= blocks.length * 0.6 || blocks.length <= 3) {
         // 대부분 새 내용이면 전체를 한 번에 (문맥 품질이 가장 좋다)
-        sealedResult = await llmTranslate(sys, sealed, srcCode, dstCode, vault, { contextLines, ownerChatId });
+        const chunks = splitTranslationChunks(sealed);
+        const rendered = await mapTranslationParts(chunks, async chunk => {
+            const [, before, body, after] = chunk.match(/^(\s*)([\s\S]*?)(\s*)$/);
+            const out = hasTranslatable(body)
+                ? await llmTranslate(sys, body, srcCode, dstCode, vault, { contextLines, ownerChatId, job })
+                : body;
+            return before + out + after;
+        }, { job, progress: true });
+        sealedResult = rendered.join('');
         // 문단 수가 맞으면 문단 캐시도 채워 다음 수정 때 재사용
         if (s.cacheEnabled) {
             const outBlocks = splitBlocks(sealedResult);
@@ -1011,20 +1054,22 @@ async function translateText(rawText, srcCode, dstCode, { mesId = -1, fresh = fa
     } else {
         // 일부 문단만 바뀜: 바뀐 문단만 앞뒤 문맥과 함께 재번역 (비용 절감)
         const results = blocks.map((b, i) => cached[i] ?? b.text);
-        for (const i of missingIdx) {
+        await mapTranslationParts(missingIdx, async i => {
             const neighbors = [];
-            if (i > 0) neighbors.push(`(preceding paragraph, already rendered)\n${blocks[i - 1].text}\n  ⇢ ${results[i - 1]}`);
+            if (i > 0 && cached[i - 1]) neighbors.push(`(preceding paragraph, already rendered)\n${blocks[i - 1].text}\n  ⇢ ${cached[i - 1]}`);
             if (i < blocks.length - 1 && cached[i + 1]) neighbors.push(`(following paragraph, already rendered)\n${blocks[i + 1].text}\n  ⇢ ${cached[i + 1]}`);
             const out = await llmTranslate(sys, blocks[i].text, srcCode, dstCode, vault, {
                 contextLines: [...contextLines, ...neighbors],
-                ownerChatId,
+                ownerChatId, job,
             });
             results[i] = out;
             if (s.cacheEnabled) writeBlockCache(i, out);
-        }
+        }, { job, progress: true });
         sealedResult = blocks.map((b, i) => results[i] + b.sep).join('');
     }
 
+    job?.check();
+    if (currentChatId() !== ownerChatId || getStore() !== store) throw new Error('채팅방이 바뀌어 번역을 중단했습니다.');
     if (s.cacheEnabled) {
         store.wholes[wholeKey] = { t: sealedResult, ts: Date.now() };
         pruneStore(store);
@@ -1122,37 +1167,52 @@ async function withTranslationSlot(task) {
     }
 }
 
-async function mapTranslationParts(parts, translate) {
+async function mapTranslationParts(parts, translate, { job = null, progress = false } = {}) {
     const results = new Array(parts.length);
     let cursor = 0;
-    let failed = false;
+    let firstError;
+    if (progress) job?.plan(parts.length);
     const worker = async () => {
-        while (!failed && cursor < parts.length) {
+        while (!job?.signal.aborted && cursor < parts.length) {
             const index = cursor++;
+            let error;
             try {
+                job?.check();
                 results[index] = await translate(parts[index]);
-            } catch (error) {
-                failed = true;
-                throw error;
+            } catch (e) {
+                error = e;
+                firstError ||= e;
+            } finally {
+                if (progress) job?.settled(error);
             }
         }
     };
+    // Finish the other parts after an ordinary failure so a retry can reuse them.
     await Promise.all(Array.from({ length: Math.min(TRANSLATION_CONCURRENCY, parts.length) }, worker));
+    job?.check();
+    if (firstError) throw firstError;
     return results;
 }
 
 /** LLM 한 번 호출 + 봉인·품질 검증 재시도 */
-async function llmTranslate(sys, sealedChunk, srcCode, dstCode, vault, { contextLines = [], ownerChatId = null } = {}) {
+async function llmTranslate(sys, sealedChunk, srcCode, dstCode, vault, options = {}) {
+    const job = options.job;
+    const task = () => llmTranslatePart(sys, sealedChunk, srcCode, dstCode, vault, options);
+    return job ? job.part(JSON.stringify([sealedChunk, options.contextLines || []]), task) : task();
+}
+
+async function llmTranslatePart(sys, sealedChunk, srcCode, dstCode, vault, { contextLines = [], ownerChatId = null, job = null } = {}) {
+    job?.check();
     const s = getSettings();
     const chunks = splitTranslationChunks(sealedChunk);
     if (chunks.length > 1) {
         const results = await mapTranslationParts(chunks, async chunk => {
             const [, before, body, after] = chunk.match(/^(\s*)([\s\S]*?)(\s*)$/);
             const translated = hasTranslatable(body)
-                ? await llmTranslate(sys, body, srcCode, dstCode, vault, { contextLines, ownerChatId })
+                ? await llmTranslate(sys, body, srcCode, dstCode, vault, { contextLines, ownerChatId, job })
                 : body;
             return before + translated + after;
-        });
+        }, { job });
         return results.join('');
     }
     const sealsIn = [...sealedChunk.matchAll(SEAL_RX)].map(m => Number(m[1]));
@@ -1161,9 +1221,13 @@ async function llmTranslate(sys, sealedChunk, srcCode, dstCode, vault, { context
 
     const attempt = async (extraNote) => {
         const user = buildUserPrompt(sealedChunk, srcCode, dstCode, { contextLines, extraNote, ownerChatId });
-        bumpStats('calls');
-        bumpStats('chars', sealedChunk.length);
-        const raw = await withTranslationSlot(() => callTranslator(sys, user));
+        const raw = await withTranslationSlot(() => {
+            job?.check();
+            bumpStats('calls');
+            bumpStats('chars', sealedChunk.length);
+            return callTranslator(sys, user, { signal: job?.signal });
+        });
+        job?.check();
         return tidyOutput(raw, sealedChunk);
     };
 
@@ -1183,20 +1247,30 @@ async function llmTranslate(sys, sealedChunk, srcCode, dstCode, vault, { context
         return { notes, invalid };
     };
 
-    let out = await attempt('');
-    let { notes, invalid } = findIssues(out);
-
-    // A model may collapse blank lines despite preserving the actual text.
-    // Retry each paragraph separately instead of rejecting the entire message.
-    if (invalid?.startsWith('paragraph structure mismatch')) {
+    const fallbackKey = JSON.stringify([sealedChunk, contextLines]);
+    const translateParagraphs = async () => {
         const results = await mapTranslationParts(splitBlocks(sealedChunk), async block => {
             const [, before, body, after] = block.text.match(/^(\s*)([\s\S]*?)(\s*)$/);
             const translated = hasTranslatable(body)
-                ? await llmTranslate(sys, body, srcCode, dstCode, vault, { contextLines, ownerChatId })
+                ? await llmTranslate(sys, body, srcCode, dstCode, vault, { contextLines, ownerChatId, job })
                 : body;
             return before + translated + after + block.sep;
-        });
+        }, { job });
         return results.join('');
+    };
+    if (job?.fallbacks[fallbackKey]) return translateParagraphs();
+
+    let out = await attempt('');
+    let { notes, invalid } = findIssues(out);
+
+    // Remember this route too, so a failed paragraph retry does not first repeat
+    // the rejected whole-chunk request.
+    if (invalid?.startsWith('paragraph structure mismatch')) {
+        if (job) {
+            job.fallbacks[fallbackKey] = true;
+            job.save();
+        }
+        return translateParagraphs();
     }
 
     if (notes.length && s.structureRetry) {
@@ -1218,6 +1292,59 @@ async function llmTranslate(sys, sealedChunk, srcCode, dstCode, vault, { context
 
 const inFlight = new Set();
 
+const translationJobs = new Map();
+
+function startTranslationJob(key, { mesId = -1, label = '번역', isCurrent, retry, fresh = false, batch = false } = {}) {
+    const ownerChatId = currentChatId();
+    const job = new TranslationJob({
+        isCurrent: () => currentChatId() === ownerChatId && (!isCurrent || isCurrent()),
+        onChange: () => renderTranslationJobs(),
+    });
+    Object.assign(job, { key, mesId, label, retry, fresh, batch, ownerChatId });
+    translationJobs.set(key, job);
+    renderTranslationJobs();
+    return job;
+}
+
+function renderTranslationJobs() {
+    for (const [key, job] of translationJobs) {
+        let $row = $('.icb_progress').filter(function () { return $(this).attr('data-job-key') === key; });
+        if (job.ownerChatId !== currentChatId() || !job.isCurrent() || job.status === 'completed') {
+            $row.remove();
+            continue;
+        }
+        if (!$row.length) {
+            $row = $('<div class="icb_progress" role="status" aria-live="polite"><span class="icb_progress_text"></span><div class="icb_progress_actions"></div></div>')
+                .attr('data-job-key', key);
+            if (job.mesId >= 0) {
+                const $text = $(`#chat .mes[mesid="${job.mesId}"] .mes_text`);
+                if (!$text.length) continue;
+                $text.after($row);
+            } else $('#icb_jobs').append($row);
+        }
+        const state = { running: '번역 중', failed: '번역 실패', cancelled: '번역 취소' }[job.status];
+        $row.find('.icb_progress_text').text(`${job.label} · ${state} · ${job.done}/${job.total || '?'} 완료${job.failed ? ` · 실패 ${job.failed}` : ''}${job.reused ? ` · 재사용 ${job.reused}` : ''} · ${job.elapsed}초`);
+        if ($row.attr('data-state') !== job.status) {
+            $row.attr('data-state', job.status);
+            const $actions = $row.find('.icb_progress_actions').empty();
+            if (job.status === 'running') {
+                $actions.append($('<button type="button" class="menu_button icb_cancel_job">취소</button>'));
+            } else {
+                $actions.append($('<button type="button" class="menu_button icb_retry_job"></button>')
+                    .text(job.status === 'failed' ? '실패한 부분 재번역' : '이어서 번역'));
+            }
+        }
+    }
+}
+
+function discardMessageJobs(mesId) {
+    for (const key of [`in:${mesId}`, `out:${mesId}`]) {
+        translationJobs.get(key)?.cancel();
+        translationJobs.delete(key);
+        $('.icb_progress').filter(function () { return $(this).attr('data-job-key') === key; }).remove();
+    }
+}
+
 function isSwipeGenerating(mesId) {
     return $(`#chat .mes[mesid="${mesId}"] .mes_text`).text() === '...';
 }
@@ -1228,7 +1355,7 @@ function setBusyIcon(mesId, busy) {
 }
 
 /** 수신(AI 응답) 메시지 번역: 모델어 → 감상어 */
-async function translateIncoming(mesId, { force = false, fresh = false } = {}) {
+async function translateIncoming(mesId, { force = false, fresh = false, resume = false, batch = false } = {}) {
     const s = getSettings();
     const message = chat[mesId];
     if (!message || isSwipeGenerating(mesId)) return;
@@ -1254,37 +1381,54 @@ async function translateIncoming(mesId, { force = false, fresh = false } = {}) {
     }
 
     if (!force && s.skipIfNative && looksLikeLang(source, s.viewLang)) return;
+    const previousJob = translationJobs.get(`in:${mesId}`);
+    if (!force && previousJob?.isCurrent() && ['cancelled', 'failed'].includes(previousJob.status)) return;
 
-    const flightKey = `in:${mesId}`;
+    const flightKey = `in:${currentChatId()}:${mesId}:${getStringHash(source)}`;
     if (inFlight.has(flightKey)) return;
     inFlight.add(flightKey);
     setBusyIcon(mesId, true);
+    const job = startTranslationJob(`in:${mesId}`, {
+        mesId: Number(mesId), label: '응답 번역', fresh, batch,
+        isCurrent: () => chat[mesId] === message && String(message.mes || '') === source,
+        retry: () => translateIncoming(mesId, { force: true, fresh, resume: true }),
+    });
+    let error;
     try {
-        const translated = await translateText(source, s.storyLang, s.viewLang, { mesId: Number(mesId), fresh });
-        // 번역 도중 본문이 바뀌었으면(스와이프 등) 폐기
-        if (String(chat[mesId]?.mes || '') !== source) return;
+        const translated = await translateText(source, s.storyLang, s.viewLang, { mesId: Number(mesId), fresh, resume, job });
+        job.check();
         message.extra.display_text = translated;
         message.extra.interpres_codeblocks_src = getStringHash(source);   // 이 번역이 어느 원문의 것인지
         updateMessageBlock(Number(mesId), message);
 
         if (s.translateReasoning && message.extra.reasoning) {
-            const rt = await translateText(String(message.extra.reasoning), s.storyLang, s.viewLang, { mesId: Number(mesId) });
+            const rt = await translateText(String(message.extra.reasoning), s.storyLang, s.viewLang, { mesId: Number(mesId), job });
+            job.check();
             message.extra.reasoning_display_text = rt;
             updateReasoningUI(Number(mesId));
         }
+        job.check();
         await getContext().saveChat();
+        return true;
     } catch (e) {
-        console.error(`[${MODULE_NAME}] 번역 실패:`, e);
-        toastr.error(String(e.message || e), '번역 실패');
+        error = e;
+        if (!job.signal.aborted) {
+            console.error(`[${MODULE_NAME}] 번역 실패:`, e);
+            toastr.error(`${String(e.message || e)} 성공한 부분은 보관했습니다. 메시지의 재번역 버튼으로 다시 시도하세요.`, '번역 실패');
+        }
+        return false;
     } finally {
+        job.finish(error);
         inFlight.delete(flightKey);
-        setBusyIcon(mesId, false);
-        decorateMessages();
+        if (job.ownerChatId === currentChatId() && translationJobs.get(job.key) === job) {
+            setBusyIcon(mesId, false);
+            decorateMessages();
+        }
     }
 }
 
 /** 발신(내 입력) 메시지 번역: 감상어 → 모델어. 원문은 화면에 남긴다 */
-async function translateOutgoing(mesId) {
+async function translateOutgoing(mesId, { resume = false } = {}) {
     const s = getSettings();
     const message = chat[mesId];
     if (!message) return;
@@ -1294,22 +1438,54 @@ async function translateOutgoing(mesId) {
     if (!source.trim()) return;
     if (s.skipIfNative && looksLikeLang(source, s.storyLang)) return;
 
-    const flightKey = `out:${mesId}`;
+    const flightKey = `out:${currentChatId()}:${mesId}:${getStringHash(source)}`;
     if (inFlight.has(flightKey)) return;
     inFlight.add(flightKey);
+    const job = startTranslationJob(`out:${mesId}`, {
+        mesId: Number(mesId), label: '입력 번역',
+        isCurrent: () => chat[mesId] === message && String(message.mes || '') === source,
+        retry: () => translateOutgoing(mesId, { resume: true }),
+    });
+    let error;
     try {
-        const translated = await translateText(source, s.viewLang, s.storyLang, { mesId: Number(mesId) });
-        if (String(chat[mesId]?.mes || '') !== source) return;
+        const translated = await translateText(source, s.viewLang, s.storyLang, { mesId: Number(mesId), resume, job });
+        job.check();
         message.extra.display_text = source;   // 화면엔 내가 쓴 원문
         message.mes = translated;              // 모델에겐 번역문
         updateMessageBlock(Number(mesId), message);
         // 저장은 이어지는 생성 흐름이 끝나며 자동으로 이뤄진다
     } catch (e) {
-        console.error(`[${MODULE_NAME}] 입력 번역 실패:`, e);
-        toastr.error(String(e.message || e), '입력 번역 실패');
+        error = e;
+        if (!job.signal.aborted) {
+            console.error(`[${MODULE_NAME}] 입력 번역 실패:`, e);
+            toastr.error(String(e.message || e), '입력 번역 실패');
+        }
     } finally {
+        job.finish(error);
         inFlight.delete(flightKey);
     }
+}
+
+async function translateInput({ resume = false } = {}) {
+    if (translationJobs.get('input')?.status === 'running') return;
+    const $ta = $('#send_textarea');
+    const text = String($ta.val() || '');
+    if (!text.trim()) { toastr.warning('입력창이 비어 있습니다.'); return; }
+    const st = getSettings();
+    const job = startTranslationJob('input', {
+        label: '입력창 번역', isCurrent: () => String($ta.val() || '') === text,
+        retry: () => translateInput({ resume: true }),
+    });
+    let error;
+    try {
+        const out = await translateText(text, st.viewLang, st.storyLang, { resume, job });
+        job.check();
+        $ta.val(out);
+        $ta[0]?.dispatchEvent(new Event('input', { bubbles: true }));
+    } catch (e) {
+        error = e;
+        if (!job.signal.aborted) toastr.error(String(e.message || e), '입력 번역 실패');
+    } finally { job.finish(error); }
 }
 
 /** 표시 토글: 번역이 있으면 원문으로, 없으면 번역 실행 */
@@ -1337,31 +1513,47 @@ async function toggleOrTranslate(mesId) {
  * ============================================================ */
 
 let batchRunning = false;
+let batchCancelled = false;
+
+function cancelBatchTranslation() {
+    batchCancelled = true;
+    for (const job of translationJobs.values()) if (job.batch) job.cancel();
+}
 
 async function translateWholeChat() {
     if (batchRunning) { toastr.info('이미 일괄 번역이 진행 중입니다.'); return; }
     batchRunning = true;
+    batchCancelled = false;
+    const ownerChatId = currentChatId();
     const s = getSettings();
     try {
         const targets = [];
         for (let i = 0; i < chat.length; i++) {
             const m = chat[i];
-            if (!m || m.is_system || m.is_user) continue;
-            if (m.extra?.display_text) continue;
+            if (!m || m.is_system || m.is_user || m.extra?.display_text) continue;
             if (s.skipIfNative && looksLikeLang(String(m.mes || ''), s.viewLang)) continue;
             targets.push(i);
         }
         if (!targets.length) { toastr.info('번역할 메시지가 없습니다.'); return; }
-        toastr.info(`${targets.length}개 메시지를 번역합니다.`, 'Interpres Codeblocks');
+        $('#icb_batch_cancel').show();
         let done = 0;
+        let failed = 0;
+        $('#icb_batch_progress').text(`일괄 번역 · 0/${targets.length} 완료`);
         for (const i of targets) {
-            await translateIncoming(i, { force: true });
-            done++;
-            if (done % 5 === 0) toastr.info(`${done}/${targets.length} 완료`, 'Interpres Codeblocks', { timeOut: 1500 });
+            if (batchCancelled || currentChatId() !== ownerChatId) break;
+            const success = await translateIncoming(i, { force: true, batch: true });
+            if (batchCancelled || currentChatId() !== ownerChatId) break;
+            if (success) done++;
+            else failed++;
+            $('#icb_batch_progress').text(`일괄 번역 · ${done}/${targets.length} 완료 · 실패 ${failed}`);
         }
-        toastr.success(`일괄 번역 완료 (${done}개)`, 'Interpres Codeblocks');
+        if (currentChatId() === ownerChatId) {
+            $('#icb_batch_progress').text(`${batchCancelled ? '일괄 번역 취소' : '일괄 번역 종료'} · ${done}/${targets.length} 완료 · 실패 ${failed}`);
+            if (!batchCancelled && !failed) toastr.success(`일괄 번역 완료 (${done}개)`, 'Interpres Custom');
+        }
     } finally {
         batchRunning = false;
+        $('#icb_batch_cancel').hide();
         updateStatsUI();
     }
 }
@@ -1387,6 +1579,7 @@ async function clearCache() {
     const store = getStore();
     store.blocks = {};
     store.wholes = {};
+    store.partials = {};
     store.stats = { calls: 0, hits: 0, chars: 0 };
     persistStore();
     updateStatsUI();
@@ -1471,7 +1664,7 @@ async function scanVoiceCards() {
     try { owner = captureBook(); } catch (e) { toastr.warning(e.message); return; }
     const material = collectScanMaterial();
     if (!material.trim()) { toastr.warning('스캔할 캐릭터/대화 자료가 없습니다.'); return; }
-    toastr.info('말투를 분석하는 중…', 'Interpres Codeblocks');
+    toastr.info('말투를 분석하는 중…', 'Interpres Custom');
     try {
         // 스캔은 JSON 한 덩이를 받아야 하므로 프리필을 태우지 않는다
         const raw = await callTranslator(VOICE_SCAN_PROMPT, material, { maxTokens: 2048, usePrefill: false });
@@ -1492,7 +1685,7 @@ async function scanVoiceCards() {
         }
         renderVoiceCards();
         await persistBook();
-        toastr.success(`말투 카드 ${added}개 갱신`, 'Interpres Codeblocks');
+        toastr.success(`말투 카드 ${added}개 갱신`, 'Interpres Custom');
     } catch (e) {
         toastr.error(String(e.message || e), '말투 스캔 실패');
     }
@@ -1504,7 +1697,7 @@ async function scanGlossary() {
     const s = getSettings();
     const material = collectScanMaterial();
     if (!material.trim()) { toastr.warning('스캔할 캐릭터/대화 자료가 없습니다.'); return; }
-    toastr.info('용어를 수집하는 중…', 'Interpres Codeblocks');
+    toastr.info('용어를 수집하는 중…', 'Interpres Custom');
     try {
         const sys = `${TERM_SCAN_PROMPT}\n\nTarget language: ${langName(s.viewLang)}.`;
         const raw = await callTranslator(sys, material, { maxTokens: 2048, usePrefill: false });
@@ -1524,7 +1717,7 @@ async function scanGlossary() {
         }
         renderGlossary();
         await persistBook();
-        toastr.success(`용어 ${added}개 추가 (중복 제외)`, 'Interpres Codeblocks');
+        toastr.success(`용어 ${added}개 추가 (중복 제외)`, 'Interpres Custom');
     } catch (e) {
         toastr.error(String(e.message || e), '용어 스캔 실패');
     }
@@ -1541,21 +1734,22 @@ function decorateMessages() {
         const $extra = $mes.find('.extraMesButtons');
         if (!$extra.length) return;
         if (!$extra.find('.icb_msg_btn').length) {
-            $extra.prepend('<div title="번역 (Interpres Codeblocks)" class="mes_button icb_msg_btn fa-solid fa-earth-asia" data-i18n="[title]번역"></div>');
+            $extra.prepend('<div title="번역 (Interpres Custom)" class="mes_button icb_msg_btn fa-solid fa-earth-asia" data-i18n="[title]번역"></div>');
         }
         const hasTrans = Boolean(chat[Number($mes.attr('mesid'))]?.extra?.display_text);
         if (hasTrans) {
             if (!$extra.find('.icb_cmp_btn').length) {
-                $extra.prepend('<div title="원문·번역 대조/편집 (Interpres Codeblocks)" class="mes_button icb_cmp_btn fa-solid fa-scale-balanced"></div>');
+                $extra.prepend('<div title="원문·번역 대조/편집 (Interpres Custom)" class="mes_button icb_cmp_btn fa-solid fa-scale-balanced"></div>');
             }
             if (!$extra.find('.icb_redo_btn').length) {
-                $extra.prepend('<div title="재번역 (Interpres Codeblocks) — 캐시를 무시하고 처음부터 다시 번역" class="mes_button icb_redo_btn fa-solid fa-arrows-rotate"></div>');
+                $extra.prepend('<div title="재번역 (Interpres Custom) — 캐시를 무시하고 처음부터 다시 번역" class="mes_button icb_redo_btn fa-solid fa-arrows-rotate"></div>');
             }
         } else {
             $extra.find('.icb_cmp_btn').remove();
             $extra.find('.icb_redo_btn').remove();
         }
     });
+    renderTranslationJobs();
 }
 
 /* ============================================================
@@ -1863,19 +2057,16 @@ function bindUI() {
     $('#icb_batch').on('click', translateWholeChat);
     $('#icb_clear_display').on('click', clearAllTranslations);
     $('#icb_clear_cache').on('click', clearCache);
-    $('#icb_translate_input').on('click', async () => {
-        const $ta = $('#send_textarea');
-        const text = String($ta.val() || '');
-        if (!text.trim()) { toastr.warning('입력창이 비어 있습니다.'); return; }
-        const st = getSettings();
-        toastr.info('입력을 번역하는 중…', 'Interpres Codeblocks');
-        try {
-            const out = await translateText(text, st.viewLang, st.storyLang, {});
-            $ta.val(out);
-            $ta[0]?.dispatchEvent(new Event('input', { bubbles: true }));
-        } catch (e) {
-            toastr.error(String(e.message || e), '입력 번역 실패');
-        }
+    $('#icb_translate_input').on('click', () => translateInput());
+    $('#icb_batch_cancel').on('click', cancelBatchTranslation);
+    $(document).on('click', '.icb_cancel_job', function () {
+        const key = $(this).closest('.icb_progress').attr('data-job-key');
+        translationJobs.get(key)?.cancel();
+    });
+    $(document).on('click', '.icb_retry_job', function () {
+        const key = $(this).closest('.icb_progress').attr('data-job-key');
+        const job = translationJobs.get(key);
+        if (job && job.status !== 'running' && job.isCurrent()) job.retry();
     });
 
     // 메시지 버튼
@@ -1891,7 +2082,6 @@ function bindUI() {
         const mesId = Number($(this).closest('.mes').attr('mesid'));
         const message = chat[mesId];
         if (!message) return;
-        if (message.extra?.display_text) delete message.extra.display_text;
         await translateIncoming(mesId, { force: true, fresh: true });
     });
 }
@@ -1904,7 +2094,7 @@ function registerCommands() {
     try {
         SlashCommandParser.addCommandObject(SlashCommand.fromProps({
             name: 'icb',
-            helpString: 'Interpres Codeblocks 번역을 켜거나 끕니다. /icb on|off|toggle',
+            helpString: 'Interpres Custom 번역을 켜거나 끕니다. /icb on|off|toggle',
             unnamedArgumentList: [SlashCommandArgument.fromProps({ description: 'on / off / toggle', typeList: [ARGUMENT_TYPE.STRING], isRequired: false })],
             callback: async (_, value) => {
                 const st = getSettings();
@@ -1912,7 +2102,7 @@ function registerCommands() {
                 st.enabled = v === 'on' ? true : v === 'off' ? false : !st.enabled;
                 saveSettingsDebounced();
                 syncUIFromSettings();
-                return st.enabled ? 'Interpres Codeblocks: ON' : 'Interpres Codeblocks: OFF';
+                return st.enabled ? 'Interpres Custom: ON' : 'Interpres Custom: OFF';
             },
         }));
 
@@ -1991,6 +2181,7 @@ function bindEvents() {
     });
 
     eventSource.on(event_types.MESSAGE_SWIPED, async (mesId) => {
+        discardMessageJobs(mesId);
         const st = getSettings();
         if (!st.enabled || !st.autoIn) return;
         const m = chat[mesId];
@@ -2018,6 +2209,7 @@ function bindEvents() {
         if (m.extra.interpres_codeblocks_src === srcHash) return;
 
         // 본문이 실제로 바뀌었다 — 예전 번역도 원문 보기 선택도 의미를 잃는다
+        discardMessageJobs(mesId);
         const hadTranslation = Boolean(m.extra.display_text);
         delete m.extra.display_text;
         delete m.extra.interpres_codeblocks_original;
@@ -2027,6 +2219,11 @@ function bindEvents() {
     });
 
     eventSource.on(event_types.CHAT_CHANGED, () => {
+        cancelBatchTranslation();
+        for (const job of translationJobs.values()) job.cancel();
+        translationJobs.clear();
+        $('.icb_progress').remove();
+        $('#icb_batch_progress').empty();
         getStore();
         migrateCacheKeys();
         decorateMessages();
@@ -2048,8 +2245,14 @@ jQuery(async () => {
         registerCommands();
         syncUIFromSettings();
         decorateMessages();
+        setInterval(() => {
+            for (const job of translationJobs.values()) {
+                if (job.status === 'running' && !job.isCurrent()) job.cancel();
+            }
+            if ([...translationJobs.values()].some(job => job.status === 'running')) renderTranslationJobs();
+        }, 1000);
         setInterval(() => { if (statsDirty) { statsDirty = false; persistStore(); updateStatsUI(); } }, 4000);
-        console.log(`[${MODULE_NAME}] Interpres Codeblocks 초기화 완료`);
+        console.log(`[${MODULE_NAME}] Interpres Custom 초기화 완료`);
     } catch (e) {
         console.error(`[${MODULE_NAME}] 초기화 실패:`, e);
     }

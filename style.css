@@ -280,3 +280,21 @@
     .icb__section-head { flex-direction: column; }
     .icb__tools { grid-template-columns: 1fr 1fr; }
 }
+
+/* Translation progress stays outside message contents and works on mobile. */
+.icb_progress {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    margin: 8px 0;
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 8px;
+    font-size: 0.85em;
+}
+.icb_progress_text { flex: 1 1 180px; overflow-wrap: anywhere; }
+.icb_progress_actions { display: flex; gap: 6px; }
+.icb_progress .menu_button { margin: 0; width: auto; }
+.icb_progress[data-state="failed"] { border-color: #c88c59; }
+#icb_batch_progress { font-size: 0.85em; margin-top: 8px; }

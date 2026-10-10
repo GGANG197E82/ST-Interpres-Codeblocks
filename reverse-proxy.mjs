@@ -33,11 +33,14 @@ export function buildProxyRequest(cfg, systemPrompt, userPrompt, tokens, prefill
     };
 }
 
-export async function requestReverseProxy(cfg, systemPrompt, userPrompt, tokens, prefill, headers, fetchFn = fetch) {
+export async function requestReverseProxy(cfg, systemPrompt, userPrompt, tokens, prefill, headers, fetchFn = fetch, signal) {
     cfg = { ...cfg };
     const body = buildProxyRequest(cfg, systemPrompt, userPrompt, tokens, prefill);
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), Math.max(10, Number(cfg.timeoutSec) || 120) * 1000);
+    const onAbort = () => controller.abort();
+    signal?.addEventListener('abort', onAbort, { once: true });
+    if (signal?.aborted) controller.abort();
     try {
         const response = await fetchFn('/api/backends/chat-completions/generate', {
             method: 'POST', headers, signal: controller.signal, body: JSON.stringify(body),
@@ -58,7 +61,8 @@ export async function requestReverseProxy(cfg, systemPrompt, userPrompt, tokens,
         }
         return content;
     } catch (e) {
+        if (signal?.aborted) throw e;
         if (e.name === 'AbortError') throw new Error('프록시 응답 대기 시간이 초과되었습니다. 잠시 후 다시 시도하세요.');
         throw e;
-    } finally { clearTimeout(timeout); }
+    } finally { clearTimeout(timeout); signal?.removeEventListener('abort', onAbort); }
 }
