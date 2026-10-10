@@ -816,7 +816,7 @@ function looksLikeLang(text, code) {
  */
 function settingsFingerprint() {
     // Keep original-mode caches usable; never reuse them in code-block mode.
-    return getStringHash(`rev${PROMPT_REV}${getSettings().translateCodeBlocks ? '|code-blocks-v1' : ''}`);
+    return getStringHash(`rev${PROMPT_REV}${getSettings().translateCodeBlocks ? '|code-blocks-v2' : ''}`);
 }
 
 /** 구버전(v1.1.0 이하) 지문 — 설정 전체를 섞던 공식. 캐시 키 이전에만 쓴다 */
@@ -1045,14 +1045,14 @@ async function translateText(rawText, srcCode, dstCode, { mesId = -1, fresh = fa
  * 번역 대신 원문 분석/해설을 늘어놓는 사고를 걸러낸다.
  * 문제가 없으면 null, 있으면 이유 문자열을 반환.
  */
-function validateRendering(out, sealedChunk, srcCode, dstCode) {
+function validateRendering(out, sealedChunk, srcCode, dstCode, { structured = false } = {}) {
     const source = String(sealedChunk).replace(SEAL_RX, '').trim();
     if (!out || !out.trim()) return 'empty reply';
     if (source.length < 80) return null; // 짧은 조각은 판별이 불안정하므로 통과
 
     // 1) 언어 검사: 원문이 확실히 원문 언어인데 결과도 여전히 원문 언어면 번역이 아니다
     const distinctive = ['ko', 'ja', 'zh', 'ru', 'th'];
-    if (distinctive.includes(dstCode) && scriptRatio(out, dstCode) < 0.25 && scriptRatio(source, dstCode) < 0.25) {
+    if (!structured && distinctive.includes(dstCode) && scriptRatio(out, dstCode) < 0.25 && scriptRatio(source, dstCode) < 0.25) {
         return `reply is not written in the target language`;
     }
     if (srcCode !== dstCode && distinctive.includes(srcCode)
@@ -1063,7 +1063,7 @@ function validateRendering(out, sealedChunk, srcCode, dstCode) {
     // 2) 구조 검사: 문단 수가 크게 어긋나면 해설/분석일 가능성이 높다
     const srcBlocks = source.split(/\n{2,}/).filter(b => b.trim()).length;
     const outBlocks = out.split(/\n{2,}/).filter(b => b.trim()).length;
-    if (srcBlocks >= 4 && (outBlocks < srcBlocks * 0.45 || outBlocks > srcBlocks * 2.2)) {
+    if (!structured && srcBlocks >= 4 && (outBlocks < srcBlocks * 0.45 || outBlocks > srcBlocks * 2.2)) {
         return `paragraph structure mismatch (source ${srcBlocks}, reply ${outBlocks})`;
     }
 
@@ -1074,10 +1074,52 @@ function validateRendering(out, sealedChunk, srcCode, dstCode) {
     return null;
 }
 
+/** Bound requests at paragraph/line boundaries; retain every separator and seal. */
+function splitTranslationChunks(text, maxChars = 4000, maxParagraphs = 12) {
+    const chunks = [];
+    let current = '', paragraphs = 0;
+    const flush = () => {
+        if (current) chunks.push(current);
+        current = '';
+        paragraphs = 0;
+    };
+    for (const block of splitBlocks(text)) {
+        const piece = block.text + block.sep;
+        if (current && (current.length + piece.length > maxChars || paragraphs >= maxParagraphs)) flush();
+        if (piece.length > maxChars) {
+            // A long HTML/code paragraph may contain many single-spaced lines.
+            for (const line of piece.match(/[^\n]*\n|[^\n]+$/g) || []) {
+                if (current && current.length + line.length > maxChars) flush();
+                current += line;
+            }
+            paragraphs++;
+        } else {
+            current += piece;
+            paragraphs++;
+        }
+    }
+    flush();
+    return chunks;
+}
+
 /** LLM 한 번 호출 + 봉인·품질 검증 재시도 */
 async function llmTranslate(sys, sealedChunk, srcCode, dstCode, vault, { contextLines = [], ownerChatId = null } = {}) {
     const s = getSettings();
+    const chunks = splitTranslationChunks(sealedChunk);
+    if (chunks.length > 1) {
+        const results = [];
+        for (const chunk of chunks) {
+            const [, before, body, after] = chunk.match(/^(\s*)([\s\S]*?)(\s*)$/);
+            const translated = hasTranslatable(body)
+                ? await llmTranslate(sys, body, srcCode, dstCode, vault, { contextLines, ownerChatId })
+                : body;
+            results.push(before + translated + after);
+        }
+        return results.join('');
+    }
     const sealsIn = [...sealedChunk.matchAll(SEAL_RX)].map(m => Number(m[1]));
+    // Code/HTML contains syntax and layout whitespace, not just prose paragraphs.
+    const structured = s.translateCodeBlocks && vault.some(piece => /^[\t ]*`{3,}/.test(piece));
 
     const attempt = async (extraNote) => {
         const user = buildUserPrompt(sealedChunk, srcCode, dstCode, { contextLines, extraNote, ownerChatId });
@@ -1089,7 +1131,7 @@ async function llmTranslate(sys, sealedChunk, srcCode, dstCode, vault, { context
 
     const findIssues = (out) => {
         const notes = [];
-        const invalid = validateRendering(out, sealedChunk, srcCode, dstCode);
+        const invalid = validateRendering(out, sealedChunk, srcCode, dstCode, { structured });
         if (invalid) {
             notes.push(`[OUTPUT CHECK] Your previous reply was rejected: ${invalid}. It read as analysis, commentary, or an unfinished draft — not the rendered passage. Reply again with NOTHING but the complete ${langName(dstCode)} rendering: first word to last word, every paragraph, no thoughts, no notes, no labels.`);
         }
@@ -1106,6 +1148,20 @@ async function llmTranslate(sys, sealedChunk, srcCode, dstCode, vault, { context
     let out = await attempt('');
     let { notes, invalid } = findIssues(out);
 
+    // A model may collapse blank lines despite preserving the actual text.
+    // Retry each paragraph separately instead of rejecting the entire message.
+    if (invalid?.startsWith('paragraph structure mismatch')) {
+        const results = [];
+        for (const block of splitBlocks(sealedChunk)) {
+            const [, before, body, after] = block.text.match(/^(\s*)([\s\S]*?)(\s*)$/);
+            const translated = hasTranslatable(body)
+                ? await llmTranslate(sys, body, srcCode, dstCode, vault, { contextLines, ownerChatId })
+                : body;
+            results.push(before + translated + after + block.sep);
+        }
+        return results.join('');
+    }
+
     if (notes.length && s.structureRetry) {
         console.debug(`[${MODULE_NAME}] 결과 검증 실패, 재시도:`, notes);
         out = await attempt(notes.join('\n'));
@@ -1114,7 +1170,7 @@ async function llmTranslate(sys, sealedChunk, srcCode, dstCode, vault, { context
 
     // 봉인 유실은 복원 단계에서 수습하지만, 번역 자체가 아닌 출력은 저장하면 안 된다
     if (invalid) {
-        throw new Error(`번역 검증 실패 (${invalid}) — 모델이 번역 대신 다른 출력을 반환했습니다. 추론(thinking) 모델이라면 일반 모델로 바꾸거나 응답 토큰 한도를 올려보세요.`);
+        throw new Error(`번역 검증 실패 (${invalid}) — 번역 응답이 비어 있거나 불완전합니다. 응답 토큰 한도와 번역 프롬프트를 확인하세요.`);
     }
     return out;
 }
