@@ -298,3 +298,23 @@
 .icb_progress .menu_button { margin: 0; width: auto; }
 .icb_progress[data-state="failed"] { border-color: #c88c59; }
 #icb_batch_progress { font-size: 0.85em; margin-top: 8px; }
+
+/* Per-block original / translation switch, without moving HTML or iframe content. */
+.icb_code_end { display: none !important; }
+.icb_code_start { position: relative; display: block; height: 0; margin: 0; padding: 0; }
+.icb_code_toggle {
+    position: absolute; top: 6px; right: 8px; z-index: 5;
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 30px; height: 24px; padding: 3px; border: 0; border-radius: 5px;
+    background: var(--SmartThemeBlurTintColor, #292929); color: var(--SmartThemeBodyColor, #eee);
+    cursor: pointer; font-size: 20px; line-height: 1;
+}
+.icb_code_start[data-has-pre="true"] .icb_code_toggle { right: 40px; }
+.icb_code_toggle:hover { filter: brightness(1.15); }
+.icb_code_toggle:focus-visible { outline: 2px solid currentColor; outline-offset: 2px; }
+.icb_toggle_fallback { display: none; width: 24px; height: 16px; }
+.icb_use_fallback > i { display: none; }
+.icb_use_fallback > .icb_toggle_fallback { display: block; }
+.icb_toggle_fallback rect { fill: currentColor; opacity: 0.35; }
+.icb_toggle_fallback circle { fill: currentColor; cx: 8px; }
+.icb_code_toggle[aria-checked="true"] .icb_toggle_fallback circle { cx: 20px; }

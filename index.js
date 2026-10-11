@@ -35,6 +35,7 @@ import { ARGUMENT_TYPE, SlashCommandArgument } from "../../../slash-commands/Sla
 import { MAX_BOOK_BYTES, parseBook, exportBook, mergeBook } from './book-transfer.mjs';
 import { requestReverseProxy } from './reverse-proxy.mjs';
 import { TranslationJob } from './translation-job.mjs';
+import { pairedBlocks, stripCodeAnchors, renderCodeChoices, toggleCodeChoice } from './code-block-toggle.mjs';
 
 const MODULE_NAME = 'interpres_codeblocks';
 const PROMPT_REV = 2;
@@ -931,7 +932,7 @@ function collectContextLines(mesId, dstCode) {
         const m = chat[i];
         if (!m || m.is_system) continue;
         const orig = String(m.mes || '').replace(/\s+/g, ' ').trim();
-        const trans = String(m.extra?.display_text || '').replace(/\s+/g, ' ').trim();
+        const trans = stripCodeAnchors(m.extra?.display_text || '').replace(/\s+/g, ' ').trim();
         if (!orig || !trans || orig === trans) continue;
         const clip = (t) => t.length > 220 ? t.slice(0, 220) + '…' : t;
         // 항상 "원문 ⇢ 번역" 순서로. 방향에 따라 어느 쪽이 dst인지는 모델이 언어로 안다.
@@ -1346,6 +1347,89 @@ function discardMessageJobs(mesId) {
     }
 }
 
+function rememberCodeTranslation(message, original, translated, { reset = false } = {}) {
+    const clean = stripCodeAnchors(translated);
+    const pairs = pairedBlocks(original, clean);
+    if (!pairs.length || message.is_user || !getSettings().translateCodeBlocks) {
+        delete message.extra.interpres_codeblocks_code;
+        return clean;
+    }
+    const previous = message.extra.interpres_codeblocks_code;
+    const sourceHash = getStringHash(original);
+    const originals = !reset && previous?.sourceHash === sourceHash && previous.translated === clean
+        ? previous.originals : [];
+    message.extra.interpres_codeblocks_code = { sourceHash, translated: clean, originals: originals || [] };
+    return renderCodeChoices(original, clean, originals || [], true);
+}
+
+function decorateCodeToggles(mesId, $mes) {
+    const message = chat[mesId];
+    if (!message || message.is_user || !message.extra?.display_text || !getSettings().translateCodeBlocks) return;
+    const original = String(message.mes || '');
+    const sourceHash = getStringHash(original);
+    if (message.extra.interpres_codeblocks_src !== undefined && message.extra.interpres_codeblocks_src !== sourceHash) return;
+    let state = message.extra.interpres_codeblocks_code;
+    // Older translations and hand-edited translations acquire their own baseline.
+    if (!state || state.sourceHash !== sourceHash ||
+        stripCodeAnchors(message.extra.display_text) !== renderCodeChoices(original, state.translated, state.originals)) {
+        message.extra.display_text = rememberCodeTranslation(message, original, message.extra.display_text);
+        state = message.extra.interpres_codeblocks_code;
+    }
+    if (!state) return;
+    const marked = renderCodeChoices(original, state.translated, state.originals, true);
+    if (message.extra.display_text !== marked) message.extra.display_text = marked;
+    const $text = $mes.find('.mes_text');
+    if (!$text.find('.icb_code_start').length && pairedBlocks(original, state.translated).some(b => b.closing !== null)) {
+        updateMessageBlock(Number(mesId), message);
+    }
+    const selected = new Set(state.originals);
+    $text.find('.icb_code_start').each(function () {
+        const $start = $(this);
+        const index = Number($start.attr('class').match(/(?:^|\s)icb_code_block_(\d+)(?:\s|$)/)?.[1]);
+        const $end = $text.find(`.icb_code_end.icb_code_block_${index}`);
+        if ($end.length !== 1 || $start.parent()[0] !== $end.parent()[0]) return;
+        const $nodes = $start.nextUntil($end);
+        if (!$nodes.length) return;
+        // Leave rendered HTML / iframe nodes in place; only add an overlay control.
+        $start.attr('data-has-pre', $nodes.filter('pre').add($nodes.find('pre')).length ? 'true' : 'false');
+        let $button = $start.children('.icb_code_toggle');
+        if (!$button.length) {
+            $button = $('<button type="button" class="icb_code_toggle" role="switch"><i aria-hidden="true"></i><svg class="icb_toggle_fallback" viewBox="0 0 28 16" aria-hidden="true"><rect x="1" y="1" width="26" height="14" rx="7"></rect><circle cy="8" r="5"></circle></svg></button>');
+            $start.append($button);
+        }
+        const visibleBlock = $nodes.filter(':visible').first()[0];
+        if (visibleBlock) {
+            const blockRect = visibleBlock.getBoundingClientRect();
+            const anchorRect = this.getBoundingClientRect();
+            const copySpace = $start.attr('data-has-pre') === 'true' ? 32 : 0;
+            $button.css({ top: Math.max(0, blockRect.top - anchorRect.top) + 6,
+                right: Math.max(0, anchorRect.right - blockRect.right) + 8 + copySpace });
+        }
+        const on = !selected.has(index);
+        const label = on ? '이 코드블록만 원문으로 전환' : '이 코드블록만 번역본으로 전환';
+        $button.attr({ 'data-icb-block': index, 'aria-checked': String(on), 'aria-label': label, title: label });
+        $button.children('i').attr('class', `fa-duotone fa-regular fa-toggle-large-${on ? 'on' : 'off'}`);
+        // Free Font Awesome installations may not contain the requested Pro glyphs.
+        const glyph = getComputedStyle($button.children('i')[0], '::before').content;
+        $button.toggleClass('icb_use_fallback', !glyph || glyph === 'none' || glyph === 'normal' || glyph === '""');
+    });
+}
+
+async function toggleMessageCodeBlock(mesId, index) {
+    const message = chat[mesId];
+    const state = message?.extra?.interpres_codeblocks_code;
+    if (!state || !message.extra.display_text || message.is_user) return;
+    const original = String(message.mes || '');
+    if (state.sourceHash !== getStringHash(original)) return;
+    const pairs = pairedBlocks(original, state.translated);
+    if (!Number.isInteger(index) || index < 0 || index >= pairs.length) return;
+    state.originals = toggleCodeChoice(state.originals, index, pairs.length);
+    message.extra.display_text = renderCodeChoices(original, state.translated, state.originals, true);
+    updateMessageBlock(Number(mesId), message);
+    decorateMessages();
+    await getContext().saveChat();
+}
+
 function isSwipeGenerating(mesId) {
     return $(`#chat .mes[mesid="${mesId}"] .mes_text`).text() === '...';
 }
@@ -1398,7 +1482,7 @@ async function translateIncoming(mesId, { force = false, fresh = false, resume =
     try {
         const translated = await translateText(source, s.storyLang, s.viewLang, { mesId: Number(mesId), fresh, resume, job });
         job.check();
-        message.extra.display_text = translated;
+        message.extra.display_text = rememberCodeTranslation(message, source, translated, { reset: fresh && !resume });
         message.extra.interpres_codeblocks_src = getStringHash(source);   // 이 번역이 어느 원문의 것인지
         updateMessageBlock(Number(mesId), message);
 
@@ -1568,6 +1652,7 @@ async function clearAllTranslations() {
             delete m.extra.reasoning_display_text;
             delete m.extra.interpres_codeblocks_original;
             delete m.extra.interpres_codeblocks_src;
+            delete m.extra.interpres_codeblocks_code;
         }
     }
     await getContext().saveChat();
@@ -1595,7 +1680,7 @@ async function openComparePopup(mesId) {
     const message = chat[mesId];
     if (!message) return;
     const orig = String(message.mes || '');
-    const trans = String(message.extra?.display_text || '');
+    const trans = stripCodeAnchors(message.extra?.display_text || '');
 
     const esc = (t) => $('<div>').text(t).html();
     const $dlg = $(`
@@ -1614,7 +1699,7 @@ async function openComparePopup(mesId) {
         const edited = String($dlg.find('.icb-compare__trans').val() ?? '');
         if (typeof message.extra !== 'object') message.extra = {};
         if (edited.trim()) {
-            message.extra.display_text = edited;
+            message.extra.display_text = rememberCodeTranslation(message, orig, edited, { reset: true });
             message.extra.interpres_codeblocks_src = getStringHash(orig);   // 손본 번역이 원문 그대로임을 표시
             delete message.extra.interpres_codeblocks_original;
         } else {
@@ -1737,7 +1822,9 @@ function decorateMessages() {
         if (!$extra.find('.icb_msg_btn').length) {
             $extra.prepend('<div title="번역 (Interpres Custom)" class="mes_button icb_msg_btn fa-solid fa-earth-asia" data-i18n="[title]번역"></div>');
         }
-        const hasTrans = Boolean(chat[Number($mes.attr('mesid'))]?.extra?.display_text);
+        const mesId = Number($mes.attr('mesid'));
+        decorateCodeToggles(mesId, $mes);
+        const hasTrans = Boolean(chat[mesId]?.extra?.display_text);
         if (hasTrans) {
             if (!$extra.find('.icb_cmp_btn').length) {
                 $extra.prepend('<div title="원문·번역 대조/편집 (Interpres Custom)" class="mes_button icb_cmp_btn fa-solid fa-scale-balanced"></div>');
@@ -2070,6 +2157,15 @@ function bindUI() {
         if (job && job.status !== 'running' && job.isCurrent()) job.retry();
     });
 
+    $(document).on('click', '.icb_code_toggle', async function (event) {
+        event.preventDefault();
+        event.stopPropagation();
+        const mesId = Number($(this).closest('.mes').attr('mesid'));
+        const index = Number($(this).attr('data-icb-block'));
+        try { await toggleMessageCodeBlock(mesId, index); }
+        catch (e) { toastr.error(String(e.message || e), '코드블록 표시 전환 실패'); }
+    });
+
     // 메시지 버튼
     $(document).on('click', '.icb_msg_btn', function () {
         const mesId = Number($(this).closest('.mes').attr('mesid'));
@@ -2192,6 +2288,7 @@ function bindEvents() {
             delete m.extra.display_text;
             delete m.extra.interpres_codeblocks_original;
             delete m.extra.interpres_codeblocks_src;
+            delete m.extra.interpres_codeblocks_code;
         }
         await translateIncoming(mesId);
     });
@@ -2215,6 +2312,7 @@ function bindEvents() {
         delete m.extra.display_text;
         delete m.extra.interpres_codeblocks_original;
         delete m.extra.interpres_codeblocks_src;
+        delete m.extra.interpres_codeblocks_code;
         // 자동 번역이 꺼져 있어도, 번역이 붙어 있던 메시지라면 새 본문으로 맞춰준다
         if (st.autoIn || hadTranslation) await translateIncoming(mesId, { force: !st.autoIn });
     });
@@ -2243,6 +2341,7 @@ jQuery(async () => {
         $('#extensions_settings2').append(html);
         bindUI();
         bindEvents();
+        window.addEventListener('resize', decorateMessages);
         registerCommands();
         syncUIFromSettings();
         decorateMessages();
