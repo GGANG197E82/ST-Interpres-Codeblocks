@@ -69,6 +69,7 @@ const DEFAULT_SETTINGS = {
     structureRetry: true,    // 봉인 유실 시 자동 재시도
     cacheEnabled: true,
     translateCodeBlocks: true, // Translate fenced content while protecting fence lines
+    showCodeBlockToggles: true,
     sealMacros: true,        // {{매크로}} 봉인
     sealTags: '',            // 번역에서 통째로 제외할 HTML 태그명 (쉼표 구분)
     readerNote: '',          // 독자 지시문
@@ -952,7 +953,7 @@ function bumpStats(field, amount = 1) {
  * 핵심 번역 함수.
  * 1) 봉인 → 2) 메시지 전체 캐시 → 3) 문단 캐시로 부분 재사용 → 4) LLM 호출 → 5) 복원·검증
  */
-async function translateText(rawText, srcCode, dstCode, { mesId = -1, fresh = false, resume = false, job = null } = {}) {
+async function translateText(rawText, srcCode, dstCode, { mesId = -1, fresh = false, resume = false, job = null, previous = null } = {}) {
     const s = getSettings();
     const text = String(rawText ?? '');
     if (!text.trim()) return text;
@@ -996,7 +997,7 @@ async function translateText(rawText, srcCode, dstCode, { mesId = -1, fresh = fa
     }
 
     // 메시지 전체 캐시 (재번역 시에는 건너뛴다)
-    if (s.cacheEnabled && !fresh && store.wholes[wholeKey]) {
+    if (s.cacheEnabled && !fresh && !previous && store.wholes[wholeKey]) {
         bumpStats('hits');
         const { restored } = unsealText(store.wholes[wholeKey].t, vault);
         persistStore();
@@ -1005,6 +1006,24 @@ async function translateText(rawText, srcCode, dstCode, { mesId = -1, fresh = fa
 
     const blocks = splitBlocks(sealed);
     const blockMeta = blocks.map(b => blockCacheKey(b.text, vault, srcCode, dstCode, fp));
+    const previousBlocks = new Map();
+    if (previous?.translated?.trim()) {
+        const old = sealText(previous.source);
+        const rendered = sealText(stripCodeAnchors(previous.translated));
+        const oldBlocks = splitBlocks(old.sealed);
+        const outBlocks = splitBlocks(rendered.sealed);
+        // Reuse the user's actual translation, including manual edits, only when
+        // paragraph boundaries and protected syntax can be matched safely.
+        if (oldBlocks.length === outBlocks.length && JSON.stringify(old.vault) === JSON.stringify(rendered.vault)) {
+            oldBlocks.forEach((block, i) => {
+                const meta = blockCacheKey(block.text, old.vault, srcCode, dstCode, fp);
+                previousBlocks.set(meta.key, remapSeals(outBlocks[i].text, n => {
+                    const index = meta.order.indexOf(n);
+                    return index < 0 ? null : index;
+                }));
+            });
+        }
+    }
     const readBlockCache = (i) => {
         const hit = store.blocks[blockMeta[i].key];
         if (!hit) return null;
@@ -1019,6 +1038,9 @@ async function translateText(rawText, srcCode, dstCode, { mesId = -1, fresh = fa
         store.blocks[blockMeta[i].key] = { t: canon, ts: Date.now() };
     };
     const cached = blocks.map((b, i) => {
+        if (!fresh && previousBlocks.has(blockMeta[i].key)) {
+            return remapSeals(previousBlocks.get(blockMeta[i].key), n => blockMeta[i].order[n] ?? null);
+        }
         if (!s.cacheEnabled || fresh || !hasTranslatable(b.text)) return null;
         return readBlockCache(i);
     });
@@ -1030,7 +1052,7 @@ async function translateText(rawText, srcCode, dstCode, { mesId = -1, fresh = fa
         // 전 문단 캐시 적중
         bumpStats('hits');
         sealedResult = blocks.map((b, i) => (cached[i] ?? b.text) + b.sep).join('');
-    } else if (missingIdx.length >= blocks.length * 0.6 || blocks.length <= 3) {
+    } else if (!previous && (missingIdx.length >= blocks.length * 0.6 || blocks.length <= 3)) {
         // 대부분 새 내용이면 전체를 한 번에 (문맥 품질이 가장 좋다)
         const chunks = splitTranslationChunks(sealed);
         const rendered = await mapTranslationParts(chunks, async chunk => {
@@ -1363,6 +1385,10 @@ function rememberCodeTranslation(message, original, translated, { reset = false 
 }
 
 function decorateCodeToggles(mesId, $mes) {
+    if (!getSettings().showCodeBlockToggles) {
+        $mes.find('.icb_code_toggle').remove();
+        return;
+    }
     const message = chat[mesId];
     if (!message || message.is_user || !message.extra?.display_text || !getSettings().translateCodeBlocks) return;
     const original = String(message.mes || '');
@@ -1406,6 +1432,13 @@ function decorateCodeToggles(mesId, $mes) {
             $button.css({ top: Math.max(0, blockRect.top - anchorRect.top) + 6,
                 right: Math.max(0, anchorRect.right - blockRect.right) + 8 + copySpace });
         }
+        const copyButton = $nodes.find('.code-copy').first()[0];
+        if (copyButton) {
+            const copyRect = copyButton.getBoundingClientRect();
+            const anchorRect = this.getBoundingClientRect();
+            $button.css({ top: copyRect.top - anchorRect.top + (copyRect.height - 24) / 2,
+                right: anchorRect.right - copyRect.left + 8 });
+        }
         const on = !selected.has(index);
         const label = on ? '이 코드블록만 원문으로 전환' : '이 코드블록만 번역본으로 전환';
         $button.attr({ 'data-icb-block': index, 'aria-checked': String(on), 'aria-label': label, title: label });
@@ -1441,7 +1474,7 @@ function setBusyIcon(mesId, busy) {
 }
 
 /** 수신(AI 응답) 메시지 번역: 모델어 → 감상어 */
-async function translateIncoming(mesId, { force = false, fresh = false, resume = false, batch = false } = {}) {
+async function translateIncoming(mesId, { force = false, fresh = false, resume = false, batch = false, previous = null } = {}) {
     const s = getSettings();
     const message = chat[mesId];
     if (!message || isSwipeGenerating(mesId)) return;
@@ -1477,14 +1510,17 @@ async function translateIncoming(mesId, { force = false, fresh = false, resume =
     const job = startTranslationJob(`in:${mesId}`, {
         mesId: Number(mesId), label: '응답 번역', fresh, batch,
         isCurrent: () => chat[mesId] === message && String(message.mes || '') === source,
-        retry: () => translateIncoming(mesId, { force: true, fresh, resume: true }),
+        retry: () => translateIncoming(mesId, { force: true, fresh, resume: true, previous }),
     });
     let error;
     try {
-        const translated = await translateText(source, s.storyLang, s.viewLang, { mesId: Number(mesId), fresh, resume, job });
+        const translated = await translateText(source, s.storyLang, s.viewLang, { mesId: Number(mesId), fresh, resume, job, previous });
         job.check();
         message.extra.display_text = rememberCodeTranslation(message, source, translated, { reset: fresh && !resume });
         message.extra.interpres_codeblocks_src = getStringHash(source);   // 이 번역이 어느 원문의 것인지
+        if (Array.isArray(message.swipe_info) && Number.isInteger(message.swipe_id) && message.swipe_info[message.swipe_id]) {
+            message.swipe_info[message.swipe_id].extra = structuredClone(message.extra);
+        }
         updateMessageBlock(Number(mesId), message);
 
         if (s.translateReasoning && message.extra.reasoning) {
@@ -1688,8 +1724,8 @@ async function openComparePopup(mesId) {
     <div class="icb-compare">
         <h3>원문 · 번역 대조 <small>#${mesId}</small></h3>
         <label>원문 (모델에게 전달되는 텍스트)</label>
-        <textarea class="text_pole icb-compare__orig" rows="8" readonly>${esc(orig)}</textarea>
-        <label>번역 (화면 표시 — 직접 수정 가능)</label>
+        <textarea class="text_pole icb-compare__orig" rows="8">${esc(orig)}</textarea>
+        <label>번역 (화면 표시)</label>
         <textarea class="text_pole icb-compare__trans" rows="8">${esc(trans)}</textarea>
     </div>`);
 
@@ -1697,18 +1733,36 @@ async function openComparePopup(mesId) {
         okButton: '저장', cancelButton: '닫기', wide: true,
     });
     if (result) {
+        // Do not save an old dialog into another chat or regenerated message.
+        if (chat[mesId] !== message || String(message.mes || '') !== orig) return;
+        const editedOriginal = String($dlg.find('.icb-compare__orig').val() ?? '');
         const edited = String($dlg.find('.icb-compare__trans').val() ?? '');
         if (typeof message.extra !== 'object') message.extra = {};
+        if (editedOriginal !== orig) {
+            discardMessageJobs(mesId);
+            message.mes = editedOriginal;
+            chat_metadata.tainted = true;
+            if (Array.isArray(message.swipes) && Number.isInteger(message.swipe_id)) {
+                message.swipes[message.swipe_id] = editedOriginal;
+            }
+        }
+        delete message.extra.interpres_codeblocks_code;
+        message.extra.interpres_codeblocks_src = getStringHash(editedOriginal);
         if (edited.trim()) {
-            message.extra.display_text = rememberCodeTranslation(message, orig, edited, { reset: true });
-            message.extra.interpres_codeblocks_src = getStringHash(orig);   // 손본 번역이 원문 그대로임을 표시
+            message.extra.display_text = edited;
             delete message.extra.interpres_codeblocks_original;
         } else {
             delete message.extra.display_text;
             message.extra.interpres_codeblocks_original = true;
         }
         updateMessageBlock(Number(mesId), message);
+        if (Array.isArray(message.swipe_info) && Number.isInteger(message.swipe_id) && message.swipe_info[message.swipe_id]) {
+            message.swipe_info[message.swipe_id].extra = structuredClone(message.extra);
+        }
         await getContext().saveChat();
+        if (editedOriginal !== orig && getSettings().enabled && getSettings().autoIn) {
+            await translateIncoming(mesId, { force: true, previous: { source: orig, translated: edited } });
+        }
     }
 }
 
@@ -1935,6 +1989,7 @@ function syncUIFromSettings() {
     $('#icb_skip_native').prop('checked', s.skipIfNative);
     $('#icb_cache').prop('checked', s.cacheEnabled);
     $('#icb_translate_code_blocks').prop('checked', s.translateCodeBlocks);
+    $('#icb_show_code_block_toggles').prop('checked', s.showCodeBlockToggles);
     $('#icb_seal_macros').prop('checked', s.sealMacros);
     $('#icb_structure_retry').prop('checked', s.structureRetry);
     $('#icb_view_lang').val(s.viewLang);
@@ -1985,6 +2040,7 @@ function bindUI() {
     $('#icb_cache').on('change', function () { s().cacheEnabled = this.checked; save(); });
     $('#icb_seal_macros').on('change', function () { s().sealMacros = this.checked; save(); });
     $('#icb_translate_code_blocks').on('change', function () { s().translateCodeBlocks = this.checked; save(); });
+    $('#icb_show_code_block_toggles').on('change', function () { s().showCodeBlockToggles = this.checked; save(); decorateMessages(); });
     $('#icb_structure_retry').on('change', function () { s().structureRetry = this.checked; save(); });
     $('#icb_view_lang').on('change', function () { s().viewLang = this.value; save(); });
     $('#icb_story_lang').on('change', function () { s().storyLang = this.value; save(); });
