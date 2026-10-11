@@ -1379,14 +1379,15 @@ function decorateCodeToggles(mesId, $mes) {
     const marked = renderCodeChoices(original, state.translated, state.originals, true);
     if (message.extra.display_text !== marked) message.extra.display_text = marked;
     const $text = $mes.find('.mes_text');
-    if (!$text.find('.icb_code_start').length && pairedBlocks(original, state.translated).some(b => b.closing !== null)) {
+    // ST's MESSAGE_SANITIZE hook prefixes message HTML classes with "custom-".
+    if (!$text.find('.icb_code_start, .custom-icb_code_start').length && pairedBlocks(original, state.translated).some(b => b.closing !== null)) {
         updateMessageBlock(Number(mesId), message);
     }
     const selected = new Set(state.originals);
-    $text.find('.icb_code_start').each(function () {
+    $text.find('.icb_code_start, .custom-icb_code_start').each(function () {
         const $start = $(this);
-        const index = Number($start.attr('class').match(/(?:^|\s)icb_code_block_(\d+)(?:\s|$)/)?.[1]);
-        const $end = $text.find(`.icb_code_end.icb_code_block_${index}`);
+        const index = Number($start.attr('class').match(/(?:^|\s)(?:custom-)?icb_code_block_(\d+)(?:\s|$)/)?.[1]);
+        const $end = $text.find(`.icb_code_end.icb_code_block_${index}, .custom-icb_code_end.custom-icb_code_block_${index}`);
         if ($end.length !== 1 || $start.parent()[0] !== $end.parent()[0]) return;
         const $nodes = $start.nextUntil($end);
         if (!$nodes.length) return;
