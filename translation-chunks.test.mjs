@@ -4,10 +4,11 @@ import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 
 const source = readFileSync(new URL('./index.js', import.meta.url), 'utf8');
-function harness(render = text => text.replaceAll('Hello', '안녕')) {
+function harness(render = text => text.replaceAll('Hello', '안녕'), overrides = {}) {
+    const settings = { translateCodeBlocks: true, structureRetry: true, ...overrides };
     const calls = [];
     const context = vm.createContext({
-        getSettings: () => ({ translateCodeBlocks: true, structureRetry: true }),
+        getSettings: () => settings,
         buildUserPrompt: text => text,
         callTranslator: async (_, text) => { calls.push(text); return render(text); },
         tidyOutput: text => text.trim(), bumpStats() {},
@@ -17,7 +18,7 @@ function harness(render = text => text.replaceAll('Hello', '안녕')) {
     vm.runInContext('const SEAL_RX = /<\\s*seal[-_ ]?(\\d+)\\s*\\/?\\s*>/gi;' +
         source.slice(source.indexOf('function splitBlocks('), source.indexOf('/** 직전 턴들의')) +
         source.slice(source.indexOf('function validateRendering('), source.indexOf('const inFlight =')), context);
-    return { context, calls };
+    return { context, calls, settings };
 }
 
 test('197 paragraphs translate in bounded requests without losing separators or content', async () => {
@@ -97,4 +98,67 @@ test('request slots are released after API rejection and queued work can finish'
     assert.equal(results.filter(result => result.status === 'rejected').length, 3);
     assert.deepEqual(results.slice(3).map(result => result.value), [3, 4, 5, 6, 7]);
     assert.equal(await context.withTranslationSlot(async () => 'ready'), 'ready');
+});
+
+
+test('larger configured chunks reduce requests while retaining all 197 paragraphs', async () => {
+    const old = harness();
+    const improved = harness(undefined, { chunkChars: 8000, chunkParagraphs: 24 });
+    const text = Array.from({ length: 197 }, (_, n) => `Hello ${n}: ${'A story sentence. '.repeat(9)}`).join('\n\n');
+    const before = await old.context.llmTranslate('', text, 'en', 'ko', []);
+    const after = await improved.context.llmTranslate('', text, 'en', 'ko', []);
+    assert.equal(after, before);
+    assert.ok(improved.calls.length <= Math.ceil(old.calls.length / 2));
+    assert.ok(improved.calls.every(chunk => chunk.length <= 8000 && chunk.split(/\n{2,}/).length <= 24));
+    console.log(`197-paragraph fixture: ${old.calls.length} -> ${improved.calls.length} API requests`);
+});
+
+test('configured concurrency changes the actual global request limit', async () => {
+    for (const limit of [1, 5]) {
+        const { context } = harness(undefined, { translationConcurrency: limit });
+        let active = 0, peak = 0;
+        const results = await Promise.all(Array.from({ length: 15 }, (_, n) => context.withTranslationSlot(async () => {
+            active++; peak = Math.max(peak, active);
+            await new Promise(resolve => setTimeout(resolve, 1));
+            active--; return n;
+        })));
+        assert.equal(peak, limit); assert.equal(active, 0);
+        assert.deepEqual(results, Array.from({ length: 15 }, (_, n) => n));
+    }
+});
+
+test('lowering concurrency while requests run drains old slots before starting queued work', async () => {
+    const { context, settings } = harness();
+    const releases = []; const started = [];
+    const requests = Array.from({ length: 5 }, (_, n) => context.withTranslationSlot(() => {
+        started.push(n); return new Promise(resolve => releases.push(() => resolve(n)));
+    }));
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.equal(started.length, 3);
+    settings.translationConcurrency = 1;
+    releases.shift()(); releases.shift()();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.equal(started.length, 3);
+    releases.shift()();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.equal(started.length, 4);
+    releases.shift()();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    releases.shift()();
+    assert.deepEqual(await Promise.all(requests), [0, 1, 2, 3, 4]);
+});
+
+test('increasing concurrency can wake queued work without waiting for an active request', async () => {
+    const { context, settings } = harness(undefined, { translationConcurrency: 1 });
+    const releases = [];
+    const requests = Array.from({ length: 3 }, () => context.withTranslationSlot(() => new Promise(resolve => releases.push(resolve))));
+    await new Promise(resolve => setTimeout(resolve, 0)); assert.equal(releases.length, 1);
+    settings.translationConcurrency = 3; context.drainTranslationQueue();
+    await new Promise(resolve => setTimeout(resolve, 0)); assert.equal(releases.length, 3);
+    releases.forEach(resolve => resolve()); await Promise.all(requests);
+});
+
+test('invalid speed values fall back or clamp to bounded integer settings', () => {
+    const { context } = harness(undefined, { chunkChars: Infinity, chunkParagraphs: 999, translationConcurrency: 2.9 });
+    assert.deepEqual(JSON.parse(JSON.stringify(context.translationSpeedSettings())), { chunkChars: 4000, chunkParagraphs: 60, concurrency: 2 });
 });

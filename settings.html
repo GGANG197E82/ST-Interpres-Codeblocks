@@ -1,7 +1,7 @@
 <div id="icb_settings" class="icb">
     <div class="inline-drawer">
         <div class="inline-drawer-toggle inline-drawer-header">
-            <b><i class="fa-solid fa-earth-asia"></i> Interpres Custom <span class="icb__version">v 1.0.8</span></b>
+            <b><i class="fa-solid fa-earth-asia"></i> Interpres Custom <span class="icb__version">v 1.0.9</span></b>
             <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
         </div>
         <div class="inline-drawer-content">
@@ -267,6 +267,19 @@
 
             <!-- ===== 고급 ===== -->
             <section class="icb__panel" data-panel="advanced">
+                <div class="icb__field">
+                    <label for="icb_chunk_chars">번역 묶음 크기 (글자)</label>
+                    <input id="icb_chunk_chars" class="text_pole" type="number" min="1000" max="16000" step="1000">
+                </div>
+                <div class="icb__field">
+                    <label for="icb_chunk_paragraphs">묶음당 최대 문단 수</label>
+                    <input id="icb_chunk_paragraphs" class="text_pole" type="number" min="4" max="60" step="1">
+                </div>
+                <div class="icb__field">
+                    <label for="icb_translation_concurrency">동시 번역 요청 수</label>
+                    <input id="icb_translation_concurrency" class="text_pole" type="number" min="1" max="6" step="1">
+                </div>
+                <div class="icb__hint">기본값은 8,000자 · 24문단 · 동시 3개입니다. 긴 글을 더 크게 묶어 요청 횟수를 줄입니다. 잘림·형식 오류가 잦으면 묶음 크기를 줄이고, API 요청 제한 오류가 나면 동시 요청 수를 낮춰 주세요.</div>
                 <label class="checkbox_label">
                     <input type="checkbox" id="icb_cache">
                     <span>번역 기억(캐시) 사용 <small>같은 문단은 다시 번역하지 않음 — 수정·스와이프 시 비용 절감</small></span>

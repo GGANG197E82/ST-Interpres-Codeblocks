@@ -82,6 +82,9 @@ const DEFAULT_SETTINGS = {
     apiMode: 'current',      // current | profile | custom | proxy
     profileId: '',
     responseTokens: 8192,
+    chunkChars: 8000,
+    chunkParagraphs: 24,
+    translationConcurrency: 3,
     prefill: '',             // 번역가의 첫 마디를 미리 채워 넣는다 (필터로 빈 응답이 올 때)
     customApi: { url: '', key: '', model: '', temperature: 0.3, timeoutSec: 120 },
     reverseProxy: { provider: 'openai', url: '', key: '', model: '', temperature: 0.3, timeoutSec: 120 },
@@ -1145,7 +1148,21 @@ function validateRendering(out, sealedChunk, srcCode, dstCode, { structured = fa
 }
 
 /** Bound requests at paragraph/line boundaries; retain every separator and seal. */
-function splitTranslationChunks(text, maxChars = 4000, maxParagraphs = 12) {
+function translationSpeedSettings() {
+    const s = getSettings();
+    const bounded = (value, fallback, min, max) => {
+        const number = Number(value);
+        return Number.isFinite(number) && number > 0 ? Math.max(min, Math.min(max, Math.floor(number))) : fallback;
+    };
+    return {
+        chunkChars: bounded(s.chunkChars, 4000, 1000, 16000),
+        chunkParagraphs: bounded(s.chunkParagraphs, 12, 4, 60),
+        concurrency: bounded(s.translationConcurrency, 3, 1, 6),
+    };
+}
+
+function splitTranslationChunks(text, maxChars = translationSpeedSettings().chunkChars,
+    maxParagraphs = translationSpeedSettings().chunkParagraphs) {
     const chunks = [];
     let current = '', paragraphs = 0;
     const flush = () => {
@@ -1173,22 +1190,26 @@ function splitTranslationChunks(text, maxChars = 4000, maxParagraphs = 12) {
 }
 
 // Bound actual API requests too: paragraph fallbacks can nest inside chunk workers.
-const TRANSLATION_CONCURRENCY = 3;
 let activeTranslationRequests = 0;
 const translationRequestQueue = [];
 
-async function withTranslationSlot(task) {
-    if (activeTranslationRequests >= TRANSLATION_CONCURRENCY) {
-        await new Promise(resolve => translationRequestQueue.push(resolve));
-    } else {
+function drainTranslationQueue() {
+    while (translationRequestQueue.length && activeTranslationRequests < translationSpeedSettings().concurrency) {
         activeTranslationRequests++;
+        translationRequestQueue.shift()();
     }
+}
+
+async function withTranslationSlot(task) {
+    await new Promise(resolve => {
+        translationRequestQueue.push(resolve);
+        drainTranslationQueue();
+    });
     try {
         return await task();
     } finally {
-        const next = translationRequestQueue.shift();
-        if (next) next(); // Transfer this slot directly to the next request.
-        else activeTranslationRequests--;
+        activeTranslationRequests--;
+        drainTranslationQueue();
     }
 }
 
@@ -1213,7 +1234,7 @@ async function mapTranslationParts(parts, translate, { job = null, progress = fa
         }
     };
     // Finish the other parts after an ordinary failure so a retry can reuse them.
-    await Promise.all(Array.from({ length: Math.min(TRANSLATION_CONCURRENCY, parts.length) }, worker));
+    await Promise.all(Array.from({ length: Math.min(translationSpeedSettings().concurrency, parts.length) }, worker));
     job?.check();
     if (firstError) throw firstError;
     return results;
@@ -2020,6 +2041,9 @@ function syncUIFromSettings() {
     $('#icb_prompt_template').val(s.promptTemplate || DEFAULT_PROMPT_TEMPLATE);
     $('#icb_api_mode').val(s.apiMode);
     $('#icb_tokens').val(s.responseTokens);
+    $('#icb_chunk_chars').val(s.chunkChars);
+    $('#icb_chunk_paragraphs').val(s.chunkParagraphs);
+    $('#icb_translation_concurrency').val(s.translationConcurrency);
     $('#icb_prefill').val(s.prefill);
     $('#icb_api_url').val(s.customApi.url);
     $('#icb_api_key').val(s.customApi.key);
@@ -2094,6 +2118,18 @@ function bindUI() {
     });
     $('#icb_profile').on('change', function () { s().profileId = this.value; save(); });
     $('#icb_tokens').on('change', function () { s().responseTokens = Math.max(512, Number(this.value) || 8192); save(); });
+    for (const [id, field, speedField] of [
+        ['icb_chunk_chars', 'chunkChars', 'chunkChars'],
+        ['icb_chunk_paragraphs', 'chunkParagraphs', 'chunkParagraphs'],
+        ['icb_translation_concurrency', 'translationConcurrency', 'concurrency'],
+    ]) {
+        $(`#${id}`).on('change', function () {
+            s()[field] = Number(this.value);
+            s()[field] = translationSpeedSettings()[speedField];
+            $(this).val(s()[field]);
+            save(); drainTranslationQueue();
+        });
+    }
     $('#icb_prefill').on('change', function () { s().prefill = String(this.value ?? ''); save(); });
     $('#icb_api_url').on('change', function () { s().customApi.url = this.value.trim(); save(); });
     $('#icb_api_key').on('change', function () { s().customApi.key = this.value.trim(); save(); });
