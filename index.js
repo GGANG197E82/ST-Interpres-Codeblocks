@@ -36,6 +36,7 @@ import { MAX_BOOK_BYTES, parseBook, exportBook, mergeBook } from './book-transfe
 import { requestReverseProxy } from './reverse-proxy.mjs';
 import { TranslationJob } from './translation-job.mjs';
 import { pairedBlocks, stripCodeAnchors, renderCodeChoices, toggleCodeChoice } from './code-block-toggle.mjs';
+import { RenderRecovery } from './render-recovery.mjs';
 
 const MODULE_NAME = 'interpres_codeblocks';
 const PROMPT_REV = 2;
@@ -70,6 +71,7 @@ const DEFAULT_SETTINGS = {
     cacheEnabled: true,
     translateCodeBlocks: true, // Translate fenced content while protecting fence lines
     showCodeBlockToggles: true,
+    autoRenderRecovery: true,
     sealMacros: true,        // {{매크로}} 봉인
     sealTags: '',            // 번역에서 통째로 제외할 HTML 태그명 (쉼표 구분)
     readerNote: '',          // 독자 지시문
@@ -1895,6 +1897,21 @@ function decorateMessages() {
     renderTranslationJobs();
 }
 
+let renderRecovery = null;
+function startRenderRecovery() {
+    renderRecovery?.destroy();
+    renderRecovery = null;
+    const root = document.getElementById('chat');
+    if (!root || !getSettings().enabled || !getSettings().autoRenderRecovery) return;
+    renderRecovery = new RenderRecovery({
+        root, getContext, getChatId: currentChatId, events: event_types,
+        enabled: () => getSettings().enabled && getSettings().autoRenderRecovery,
+        isGenerating: () => $('#mes_stop').is(':visible'),
+        onRepaired: () => decorateMessages(),
+        onError: error => console.warn(`[${MODULE_NAME}] 자동 렌더 복구:`, error),
+    });
+}
+
 /* ============================================================
  * 설정 UI
  * ============================================================ */
@@ -1990,6 +2007,7 @@ function syncUIFromSettings() {
     $('#icb_cache').prop('checked', s.cacheEnabled);
     $('#icb_translate_code_blocks').prop('checked', s.translateCodeBlocks);
     $('#icb_show_code_block_toggles').prop('checked', s.showCodeBlockToggles);
+    $('#icb_auto_render_recovery').prop('checked', s.autoRenderRecovery);
     $('#icb_seal_macros').prop('checked', s.sealMacros);
     $('#icb_structure_retry').prop('checked', s.structureRetry);
     $('#icb_view_lang').val(s.viewLang);
@@ -2032,7 +2050,7 @@ function bindUI() {
     const save = () => saveSettingsDebounced();
     const s = () => getSettings();
 
-    $('#icb_enabled').on('change', function () { s().enabled = this.checked; save(); decorateMessages(); });
+    $('#icb_enabled').on('change', function () { s().enabled = this.checked; save(); startRenderRecovery(); decorateMessages(); });
     $('#icb_auto_in').on('change', function () { s().autoIn = this.checked; save(); });
     $('#icb_auto_out').on('change', function () { s().autoOut = this.checked; save(); });
     $('#icb_reasoning').on('change', function () { s().translateReasoning = this.checked; save(); });
@@ -2041,6 +2059,7 @@ function bindUI() {
     $('#icb_seal_macros').on('change', function () { s().sealMacros = this.checked; save(); });
     $('#icb_translate_code_blocks').on('change', function () { s().translateCodeBlocks = this.checked; save(); });
     $('#icb_show_code_block_toggles').on('change', function () { s().showCodeBlockToggles = this.checked; save(); decorateMessages(); });
+    $('#icb_auto_render_recovery').on('change', function () { s().autoRenderRecovery = this.checked; save(); startRenderRecovery(); });
     $('#icb_structure_retry').on('change', function () { s().structureRetry = this.checked; save(); });
     $('#icb_view_lang').on('change', function () { s().viewLang = this.value; save(); });
     $('#icb_story_lang').on('change', function () { s().storyLang = this.value; save(); });
@@ -2320,6 +2339,8 @@ function registerCommands() {
  * ============================================================ */
 
 function bindEvents() {
+    eventSource.on(event_types.APP_READY, startRenderRecovery);
+    eventSource.on(event_types.GENERATION_ENDED, () => renderRecovery?.queueAll());
     eventSource.makeFirst(event_types.CHARACTER_MESSAGE_RENDERED, async (mesId) => {
         decorateMessages();
         const st = getSettings();
@@ -2375,6 +2396,7 @@ function bindEvents() {
     });
 
     eventSource.on(event_types.CHAT_CHANGED, () => {
+        renderRecovery?.reset();
         cancelBatchTranslation();
         for (const job of translationJobs.values()) job.cancel();
         translationJobs.clear();
@@ -2398,6 +2420,8 @@ jQuery(async () => {
         $('#extensions_settings2').append(html);
         bindUI();
         bindEvents();
+        startRenderRecovery();
+        window.addEventListener('pagehide', () => renderRecovery?.destroy());
         window.addEventListener('resize', decorateMessages);
         registerCommands();
         syncUIFromSettings();
