@@ -1,7 +1,7 @@
 <div id="icb_settings" class="icb">
     <div class="inline-drawer">
         <div class="inline-drawer-toggle inline-drawer-header">
-            <b><i class="fa-solid fa-earth-asia"></i> Interpres Custom <span class="icb__version">v 1.0.9</span></b>
+            <b><i class="fa-solid fa-earth-asia"></i> Interpres Custom <span class="icb__version">v 1.0.10</span></b>
             <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
         </div>
         <div class="inline-drawer-content">
@@ -218,6 +218,8 @@
                     <p class="icb__hint">모델명과 관계없이 프록시가 받는 API 형식을 선택하세요. OpenAI 호환 주소로 Claude·Gemini를 쓰는 경우에도 OpenAI 호환을 선택합니다. 아래 연결 테스트로 확인할 수 있습니다.</p>
                 </div>
                 <div class="icb__field icb__profile-row" style="display:none;">
+                    <label class="checkbox_label"><input id="icb_background_translation" type="checkbox"><span>서버에서 백그라운드 번역</span></label>
+                    <p class="icb__hint">서버 플러그인 설치가 필요합니다. Vertex AI·Google AI Studio 프로필을 지원하며, 다른 앱을 사용하는 동안 서버가 번역을 계속합니다. 서버를 종료하면 작업이 사라집니다.</p>
                     <label for="icb_profile">커넥션 프로필</label>
                     <select id="icb_profile" class="text_pole"></select>
                 </div>

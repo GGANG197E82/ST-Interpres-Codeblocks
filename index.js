@@ -37,6 +37,7 @@ import { requestReverseProxy } from './reverse-proxy.mjs';
 import { TranslationJob } from './translation-job.mjs';
 import { pairedBlocks, stripCodeAnchors, renderCodeChoices, toggleCodeChoice } from './code-block-toggle.mjs';
 import { RenderRecovery } from './render-recovery.mjs';
+import { runBackgroundBatch } from './background-client.mjs';
 
 const MODULE_NAME = 'interpres_codeblocks';
 const PROMPT_REV = 2;
@@ -79,6 +80,7 @@ const DEFAULT_SETTINGS = {
     glossary: [],            // (구버전 전역 저장분) — 보관만 한다. 번역엔 절대 안 쓰이고, 패널에서 직접 [가져오기] 해야 챗방으로 들어온다
     voiceCards: [],          // (구버전 전역 저장분) — 위와 동일
     // 번역 모델 연결
+    backgroundTranslation: false,
     apiMode: 'current',      // current | profile | custom | proxy
     profileId: '',
     responseTokens: 8192,
@@ -778,6 +780,59 @@ async function callTranslator(systemPrompt, userPrompt, { maxTokens, usePrefill 
     });
 }
 
+/** Submit every missing part before waiting, so browser suspension cannot stall the queue. */
+async function translateBackgroundParts(sys, chunks, srcCode, dstCode, vault, { contextLines = [], contexts, ownerChatId, job } = {}) {
+    const s = getSettings();
+    const profile = s.apiMode === 'profile' && listConnectionProfiles().find(p => p.id === s.profileId);
+    if (!profile || !['vertexai', 'makersuite', 'google'].includes(profile.api)) {
+        throw new Error('서버 백그라운드 번역은 모델 탭에서 Vertex AI 또는 Google AI Studio 커넥션 프로필을 선택해 주세요.');
+    }
+    const results = new Array(chunks.length);
+    const pending = [];
+    job?.plan(chunks.length);
+    chunks.forEach((chunk, i) => {
+        const [, before, body, after] = chunk.match(/^(\s*)([\s\S]*?)(\s*)$/);
+        const lines = contexts?.[i] || contextLines;
+        const key = JSON.stringify([body, lines]);
+        if (!hasTranslatable(body)) results[i] = chunk;
+        else if (job && Object.hasOwn(job.cache, key)) results[i] = before + job.cache[key] + after;
+        else pending.push({ i, before, body, after, key, user: buildUserPrompt(body, srcCode, dstCode, { contextLines: lines, ownerChatId }) });
+    });
+    const update = state => {
+        job?.check();
+        state.results.forEach((out, n) => {
+            if (typeof out !== 'string') return;
+            const part = pending[n];
+            results[part.i] = part.before + out + part.after;
+            if (job) job.cache[part.key] = out;
+        });
+        if (job) {
+            job.done = results.filter(out => typeof out === 'string').length;
+            job.failed = state.errors.filter(Boolean).length;
+            job.save(); job.onChange(job);
+        }
+    };
+    if (pending.length) {
+        const payload = {
+            chat_completion_source: profile.api === 'google' ? 'makersuite' : profile.api, model: profile.model,
+            secret_id: profile['secret-id'], max_tokens: s.responseTokens,
+            use_sysprompt: true, temperature: 0.3,
+            ...buildProfileOverrides(profile.id),
+        };
+        if (profile.api !== 'vertexai') payload.vertexai_auth_mode = undefined;
+        bumpStats('calls', pending.length);
+        bumpStats('chars', pending.reduce((n, p) => n + p.body.length, 0));
+        await runBackgroundBatch({
+            payload, system: sys, src: srcCode, dst: dstCode,
+            structured: s.translateCodeBlocks && vault.some(piece => /^[\t ]*`{3,}/.test(piece)),
+            retry: s.structureRetry, concurrency: translationSpeedSettings().concurrency,
+            prefill: String(s.prefill || ''), tasks: pending.map(p => ({ body: p.body, user: p.user })),
+        }, { headers: getRequestHeaders(), signal: job?.signal, onProgress: update, scope: String(ownerChatId) + ':' + getStringHash(JSON.stringify([profile.id, sys, chunks, contexts, contextLines, srcCode, dstCode, s.prefill])) });
+    } else if (job) { job.done = chunks.length; job.onChange(job); }
+    job?.check();
+    return results;
+}
+
 /** 모델이 붙였을지 모르는 군더더기 제거 */
 function tidyOutput(text, original) {
     let t = String(text ?? '');
@@ -976,10 +1031,9 @@ async function translateText(rawText, srcCode, dstCode, { mesId = -1, fresh = fa
     const sys = buildSystemPrompt(srcCode, dstCode);
     if (job) {
         job.check();
-        // Include source, seals, prompt and provider identity; never store API keys here.
+        // Reuse successful parts across API changes; never persist API keys here.
         const signature = JSON.stringify([sealed, vault, srcCode, dstCode, sys, contextLines,
-            s.apiMode, s.profileId, s.customApi?.url, s.customApi?.model,
-            s.reverseProxy?.url, s.reverseProxy?.model, s.prefill]);
+            s.prefill]);
         const key = String(getStringHash(signature));
         store.partials ||= {};
         if ((fresh && !resume) || store.partials[key]?.signature !== signature) {
@@ -1060,7 +1114,9 @@ async function translateText(rawText, srcCode, dstCode, { mesId = -1, fresh = fa
     } else if (!previous && (missingIdx.length >= blocks.length * 0.6 || blocks.length <= 3)) {
         // 대부분 새 내용이면 전체를 한 번에 (문맥 품질이 가장 좋다)
         const chunks = splitTranslationChunks(sealed);
-        const rendered = await mapTranslationParts(chunks, async chunk => {
+        const rendered = s.backgroundTranslation
+            ? await translateBackgroundParts(sys, chunks, srcCode, dstCode, vault, { contextLines, ownerChatId, job })
+            : await mapTranslationParts(chunks, async chunk => {
             const [, before, body, after] = chunk.match(/^(\s*)([\s\S]*?)(\s*)$/);
             const out = hasTranslatable(body)
                 ? await llmTranslate(sys, body, srcCode, dstCode, vault, { contextLines, ownerChatId, job })
@@ -1082,13 +1138,21 @@ async function translateText(rawText, srcCode, dstCode, { mesId = -1, fresh = fa
     } else {
         // 일부 문단만 바뀜: 바뀐 문단만 앞뒤 문맥과 함께 재번역 (비용 절감)
         const results = blocks.map((b, i) => cached[i] ?? b.text);
-        await mapTranslationParts(missingIdx, async i => {
+        const contexts = missingIdx.map(i => {
             const neighbors = [];
             if (i > 0 && cached[i - 1]) neighbors.push(`(preceding paragraph, already rendered)\n${blocks[i - 1].text}\n  ⇢ ${cached[i - 1]}`);
             if (i < blocks.length - 1 && cached[i + 1]) neighbors.push(`(following paragraph, already rendered)\n${blocks[i + 1].text}\n  ⇢ ${cached[i + 1]}`);
+            return [...contextLines, ...neighbors];
+        });
+        if (s.backgroundTranslation) {
+            const translated = await translateBackgroundParts(sys, missingIdx.map(i => blocks[i].text), srcCode, dstCode, vault, { contexts, ownerChatId, job });
+            missingIdx.forEach((i, n) => {
+                results[i] = translated[n];
+                if (s.cacheEnabled) writeBlockCache(i, translated[n]);
+            });
+        } else await mapTranslationParts(missingIdx, async i => {
             const out = await llmTranslate(sys, blocks[i].text, srcCode, dstCode, vault, {
-                contextLines: [...contextLines, ...neighbors],
-                ownerChatId, job,
+                contextLines: contexts[missingIdx.indexOf(i)], ownerChatId, job,
             });
             results[i] = out;
             if (s.cacheEnabled) writeBlockCache(i, out);
@@ -1497,6 +1561,30 @@ function setBusyIcon(mesId, busy) {
 }
 
 /** 수신(AI 응답) 메시지 번역: 모델어 → 감상어 */
+const BACKGROUND_RESUME_KEY = 'icb-background-incoming';
+function backgroundResumeRecords() {
+    try { return JSON.parse(sessionStorage.getItem(BACKGROUND_RESUME_KEY) || '{}'); } catch { return {}; }
+}
+function markBackgroundResume(mesId, source, fresh, remove = false) {
+    try {
+        const records = backgroundResumeRecords();
+        const key = JSON.stringify([currentChatId(), Number(mesId)]);
+        if (remove) delete records[key];
+        else records[key] = { chatId: currentChatId(), mesId: Number(mesId), source: getStringHash(source), fresh, ts: Date.now() };
+        for (const [id, record] of Object.entries(records)) if (Date.now() - record.ts > 2 * 60 * 60 * 1000) delete records[id];
+        sessionStorage.setItem(BACKGROUND_RESUME_KEY, JSON.stringify(records));
+    } catch { /* Recovery after reload is unavailable in restricted storage. */ }
+}
+function resumeBackgroundIncoming() {
+    if (!getSettings().enabled || !getSettings().backgroundTranslation) return;
+    for (const record of Object.values(backgroundResumeRecords())) {
+        if (record.chatId !== currentChatId() || Date.now() - record.ts > 2 * 60 * 60 * 1000) continue;
+        const message = chat[record.mesId];
+        if (!message || message.is_user || message.is_system || getStringHash(String(message.mes || '')) !== record.source) continue;
+        void translateIncoming(record.mesId, { force: true, fresh: record.fresh, resume: true });
+    }
+}
+
 async function translateIncoming(mesId, { force = false, fresh = false, resume = false, batch = false, previous = null } = {}) {
     const s = getSettings();
     const message = chat[mesId];
@@ -1536,6 +1624,7 @@ async function translateIncoming(mesId, { force = false, fresh = false, resume =
         retry: () => translateIncoming(mesId, { force: true, fresh, resume: true, previous }),
     });
     let error;
+    if (s.backgroundTranslation) markBackgroundResume(mesId, source, fresh);
     try {
         const translated = await translateText(source, s.storyLang, s.viewLang, { mesId: Number(mesId), fresh, resume, job, previous });
         job.check();
@@ -1563,6 +1652,7 @@ async function translateIncoming(mesId, { force = false, fresh = false, resume =
         }
         return false;
     } finally {
+        if (s.backgroundTranslation && job.ownerChatId === currentChatId()) markBackgroundResume(mesId, source, fresh, true);
         job.finish(error);
         inFlight.delete(flightKey);
         if (job.ownerChatId === currentChatId() && translationJobs.get(job.key) === job) {
@@ -2040,6 +2130,7 @@ function syncUIFromSettings() {
     $('#icb_reader_note').val(s.readerNote);
     $('#icb_prompt_template').val(s.promptTemplate || DEFAULT_PROMPT_TEMPLATE);
     $('#icb_api_mode').val(s.apiMode);
+    $('#icb_background_translation').prop('checked', s.backgroundTranslation);
     $('#icb_tokens').val(s.responseTokens);
     $('#icb_chunk_chars').val(s.chunkChars);
     $('#icb_chunk_paragraphs').val(s.chunkParagraphs);
@@ -2116,6 +2207,7 @@ function bindUI() {
         $('.icb__proxy-api').toggle(this.value === 'proxy');
         if (this.value === 'profile') refreshProfileOptions();
     });
+    $('#icb_background_translation').on('change', function () { s().backgroundTranslation = this.checked; save(); });
     $('#icb_profile').on('change', function () { s().profileId = this.value; save(); });
     $('#icb_tokens').on('change', function () { s().responseTokens = Math.max(512, Number(this.value) || 8192); save(); });
     for (const [id, field, speedField] of [
@@ -2442,6 +2534,7 @@ function bindEvents() {
         migrateCacheKeys();
         decorateMessages();
         updateStatsUI();
+        resumeBackgroundIncoming();
         // 용어집·말투 카드는 챗방별 — 화면 목록을 이 챗의 것으로 갱신
         renderGlossary();
         renderVoiceCards();
@@ -2457,6 +2550,9 @@ jQuery(async () => {
         bindUI();
         bindEvents();
         startRenderRecovery();
+        resumeBackgroundIncoming();
+        window.addEventListener('pageshow', resumeBackgroundIncoming);
+        document.addEventListener('visibilitychange', () => { if (!document.hidden) resumeBackgroundIncoming(); });
         window.addEventListener('pagehide', () => renderRecovery?.destroy());
         window.addEventListener('resize', decorateMessages);
         registerCommands();

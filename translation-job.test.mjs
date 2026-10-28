@@ -12,7 +12,7 @@ const passage = n => `Hello ${n}: ${'A story sentence. '.repeat(8)}`;
 function engine(render) {
     let owner = 'chat-a';
     let store = { blocks: {}, wholes: {}, stats: {} };
-    const settings = { translateCodeBlocks: true, structureRetry: false, cacheEnabled: false,
+    const settings = { translateCodeBlocks: true, structureRetry: false, cacheEnabled: false, splitLongTranslations: true,
         apiMode: 'profile', profileId: 'test', customApi: {}, reverseProxy: {} };
     const calls = [];
     const context = vm.createContext({
@@ -198,4 +198,23 @@ test('completed jobs clear recovery checkpoints and respect disabled ordinary ca
     assert.equal(Object.keys(e.store.partials).length, 0);
     await e.context.translateText(text, 'en', 'ko', { job: new TranslationJob() });
     assert.equal(e.calls.length, 2);
+});
+
+
+test('switching API preserves completed parts and requests only the failed remainder', async () => {
+    let fail = true;
+    const e = engine(async text => {
+        if (fail && text.startsWith('Hello 12:')) throw new Error('provider unavailable');
+        return text.replaceAll('Hello', '안녕');
+    });
+    const text = Array.from({ length: 40 }, (_, n) => passage(n)).join('\n\n');
+    await assert.rejects(e.context.translateText(text, 'en', 'ko', { job: new TranslationJob() }), /provider unavailable/);
+    assert.equal(e.calls.length, 4);
+    e.settings.profileId = 'another-api';
+    fail = false;
+    const retry = new TranslationJob();
+    const out = await e.context.translateText(text, 'en', 'ko', { job: retry, resume: true });
+    assert.equal(out, text.replaceAll('Hello', '안녕'));
+    assert.equal(e.calls.length, 5);
+    assert.equal(retry.reused, 3);
 });
