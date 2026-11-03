@@ -1620,10 +1620,7 @@ function mountInputTranslationButton() {
     $send.before($button);
     $button.attr({ role: 'button', tabindex: 0, title: '입력창 번역', 'aria-label': '입력창 번역' });
     $button.children('span').hide();
-    const $icon = $button.children('i').attr('class', 'fa-graphite fa-thin fa-language');
-    if (!getComputedStyle($icon[0]).fontFamily.toLowerCase().includes('graphite')) {
-        $icon.addClass('icb_language_fallback');
-    }
+    $button.children('i').attr('class', 'fa-graphite fa-thin fa-language');
     $button.toggle(settings.enabled && settings.showInputTranslationButton);
 }
 

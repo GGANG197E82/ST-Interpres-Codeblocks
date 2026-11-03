@@ -331,7 +331,5 @@
 #icb_translate_input:hover { opacity: 1; }
 #icb_translate_input[aria-busy="true"] { opacity: 0.4; cursor: progress; }
 #icb_translate_input:focus-visible { outline: 2px solid currentColor; border-radius: 4px; }
-#icb_translate_input .icb_language_fallback {
-    font-family: "Font Awesome 6 Free", "Font Awesome 5 Free"; font-weight: 900;
-}
-#icb_translate_input .icb_language_fallback::before { content: "\f1ab"; }
+/* Icon fonts must not inherit the browser's italic styling for <i>. */
+#icb_translate_input > i { font-style: normal !important; }
