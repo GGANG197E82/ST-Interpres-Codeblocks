@@ -319,3 +319,19 @@
 .icb_toggle_fallback rect { fill: currentColor; opacity: 0.35; }
 .icb_toggle_fallback circle { fill: currentColor; cx: 8px; }
 .icb_code_toggle[aria-checked="true"] .icb_toggle_fallback circle { cx: 20px; }
+
+/* Manual input translation immediately beside Send. */
+#icb_translate_input {
+    display: flex; align-items: center; justify-content: center;
+    width: var(--bottomFormIconSize, 32px); flex-shrink: 0;
+    margin: 0; padding: 0; border: 0; background: transparent;
+    font-size: var(--bottomFormIconSize, 26px); cursor: pointer;
+    color: var(--SmartThemeBodyColor); opacity: 0.7;
+}
+#icb_translate_input:hover { opacity: 1; }
+#icb_translate_input[aria-busy="true"] { opacity: 0.4; cursor: progress; }
+#icb_translate_input:focus-visible { outline: 2px solid currentColor; border-radius: 4px; }
+#icb_translate_input .icb_language_fallback {
+    font-family: "Font Awesome 6 Free", "Font Awesome 5 Free"; font-weight: 900;
+}
+#icb_translate_input .icb_language_fallback::before { content: "\f1ab"; }

@@ -1,7 +1,7 @@
 <div id="icb_settings" class="icb">
     <div class="inline-drawer">
         <div class="inline-drawer-toggle inline-drawer-header">
-            <b><i class="fa-solid fa-earth-asia"></i> Interpres Custom <span class="icb__version">v 1.1.0</span></b>
+            <b><i class="fa-solid fa-earth-asia"></i> Interpres Custom <span class="icb__version">v 1.1.1</span></b>
             <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
         </div>
         <div class="inline-drawer-content">
@@ -76,6 +76,10 @@
                 <label class="checkbox_label">
                     <input type="checkbox" id="icb_auto_out">
                     <span>내 입력 자동 번역 <small>(감상어 → 모델어, 화면엔 내 원문 유지)</small></span>
+                </label>
+                <label class="checkbox_label">
+                    <input type="checkbox" id="icb_show_input_translation_button">
+                    <span>입력창 번역 버튼 표시 <small>(전송 버튼 왼쪽)</small></span>
                 </label>
                 <label class="checkbox_label">
                     <input type="checkbox" id="icb_skip_native">
@@ -342,7 +346,7 @@
             <section class="icb__panel" data-panel="tools">
                 <div class="icb__tools">
                     <div class="menu_button" id="icb_translate_input" title="입력창의 글을 모델어로 번역해 바꿔넣습니다.">
-                        <i class="fa-solid fa-keyboard"></i><span>입력창 번역</span>
+                        <i class="fa-graphite fa-thin fa-language"></i><span>입력창 번역</span>
                     </div>
                     <div class="menu_button" id="icb_batch" title="아직 번역되지 않은 AI 응답을 전부 번역합니다.">
                         <i class="fa-solid fa-layer-group"></i><span>채팅 전체 번역</span>

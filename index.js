@@ -71,6 +71,7 @@ const DEFAULT_SETTINGS = {
     cacheEnabled: true,
     translateCodeBlocks: true, // Translate fenced content while protecting fence lines
     showCodeBlockToggles: true,
+    showInputTranslationButton: true,
     autoRenderRecovery: true,
     sealMacros: true,        // {{매크로}} 봉인
     sealTags: '',            // 번역에서 통째로 제외할 HTML 태그명 (쉼표 구분)
@@ -1610,6 +1611,22 @@ async function translateOutgoing(mesId, { resume = false } = {}) {
     }
 }
 
+function mountInputTranslationButton() {
+    const settings = getSettings();
+    const $button = $('#icb_translate_input');
+    const $send = $('#send_but');
+    if (!$button.length || !$send.length) return;
+    // Move the existing input-translation control; leave all other controls intact.
+    $send.before($button);
+    $button.attr({ role: 'button', tabindex: 0, title: '입력창 번역', 'aria-label': '입력창 번역' });
+    $button.children('span').hide();
+    const $icon = $button.children('i').attr('class', 'fa-graphite fa-thin fa-language');
+    if (!getComputedStyle($icon[0]).fontFamily.toLowerCase().includes('graphite')) {
+        $icon.addClass('icb_language_fallback');
+    }
+    $button.toggle(settings.enabled && settings.showInputTranslationButton);
+}
+
 async function translateInput({ resume = false } = {}) {
     if (translationJobs.get('input')?.status === 'running') return;
     const $ta = $('#send_textarea');
@@ -2027,6 +2044,8 @@ function syncUIFromSettings() {
     $('#icb_cache').prop('checked', s.cacheEnabled);
     $('#icb_translate_code_blocks').prop('checked', s.translateCodeBlocks);
     $('#icb_show_code_block_toggles').prop('checked', s.showCodeBlockToggles);
+    $('#icb_show_input_translation_button').prop('checked', s.showInputTranslationButton);
+    mountInputTranslationButton();
     $('#icb_auto_render_recovery').prop('checked', s.autoRenderRecovery);
     $('#icb_seal_macros').prop('checked', s.sealMacros);
     $('#icb_structure_retry').prop('checked', s.structureRetry);
@@ -2073,8 +2092,9 @@ function bindUI() {
     const save = () => saveSettingsDebounced();
     const s = () => getSettings();
 
-    $('#icb_enabled').on('change', function () { s().enabled = this.checked; save(); startRenderRecovery(); decorateMessages(); });
+    $('#icb_enabled').on('change', function () { s().enabled = this.checked; save(); startRenderRecovery(); decorateMessages(); mountInputTranslationButton(); });
     $('#icb_auto_in').on('change', function () { s().autoIn = this.checked; save(); });
+    $('#icb_show_input_translation_button').on('change', function () { s().showInputTranslationButton = this.checked; save(); mountInputTranslationButton(); });
     $('#icb_auto_out').on('change', function () { s().autoOut = this.checked; save(); });
     $('#icb_reasoning').on('change', function () { s().translateReasoning = this.checked; save(); });
     $('#icb_skip_native').on('change', function () { s().skipIfNative = this.checked; save(); });
@@ -2257,6 +2277,13 @@ function bindUI() {
     $('#icb_clear_display').on('click', clearAllTranslations);
     $('#icb_clear_cache').on('click', clearCache);
     $('#icb_translate_input').on('click', () => translateInput());
+    $('#icb_translate_input').on('keydown.icb', event => {
+        if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault();
+            event.stopPropagation();
+            $('#icb_translate_input').trigger('click');
+        }
+    });
     $('#icb_batch_cancel').on('click', cancelBatchTranslation);
     $(document).on('click', '.icb_cancel_job', function () {
         const key = $(this).closest('.icb_progress').attr('data-job-key');
@@ -2374,7 +2401,10 @@ function registerCommands() {
  * ============================================================ */
 
 function bindEvents() {
-    eventSource.on(event_types.APP_READY, startRenderRecovery);
+    eventSource.on(event_types.APP_READY, () => {
+        startRenderRecovery();
+        mountInputTranslationButton();
+    });
     eventSource.on(event_types.GENERATION_ENDED, () => renderRecovery?.queueAll());
     eventSource.makeFirst(event_types.CHARACTER_MESSAGE_RENDERED, async (mesId) => {
         decorateMessages();
@@ -2455,6 +2485,7 @@ jQuery(async () => {
         $('#extensions_settings2').append(html);
         bindUI();
         bindEvents();
+        mountInputTranslationButton();
         startRenderRecovery();
         window.addEventListener('pagehide', () => renderRecovery?.destroy());
         window.addEventListener('resize', decorateMessages);
