@@ -321,15 +321,15 @@
 .icb_code_toggle[aria-checked="true"] .icb_toggle_fallback circle { cx: 20px; }
 
 /* Manual input translation immediately beside Send. */
-#icb_translate_input {
+#icb_input_translate {
     display: flex; align-items: center; justify-content: center;
     width: var(--bottomFormIconSize, 32px); flex-shrink: 0;
     margin: 0; padding: 0; border: 0; background: transparent;
     font-size: var(--bottomFormIconSize, 26px); cursor: pointer;
     color: var(--SmartThemeBodyColor); opacity: 0.7;
 }
-#icb_translate_input:hover { opacity: 1; }
-#icb_translate_input[aria-busy="true"] { opacity: 0.4; cursor: progress; }
-#icb_translate_input:focus-visible { outline: 2px solid currentColor; border-radius: 4px; }
+#icb_input_translate:hover { opacity: 1; }
+#icb_input_translate[aria-busy="true"] { opacity: 0.4; cursor: progress; }
+#icb_input_translate:focus-visible { outline: 2px solid currentColor; border-radius: 4px; }
 /* Icon fonts must not inherit the browser's italic styling for <i>. */
-#icb_translate_input > i { font-style: normal !important; }
+#icb_input_translate > i { font-style: normal !important; }

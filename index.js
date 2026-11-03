@@ -1613,14 +1613,28 @@ async function translateOutgoing(mesId, { resume = false } = {}) {
 
 function mountInputTranslationButton() {
     const settings = getSettings();
-    const $button = $('#icb_translate_input');
     const $send = $('#send_but');
-    if (!$button.length || !$send.length) return;
-    // Move the existing input-translation control; leave all other controls intact.
-    $send.before($button);
-    $button.attr({ role: 'button', tabindex: 0, title: '입력창 번역', 'aria-label': '입력창 번역' });
-    $button.children('span').hide();
-    $button.children('i').attr('class', 'fa-graphite fa-thin fa-language');
+    if (!$send.length) return;
+    let $button = $('#icb_input_translate');
+    if (!$button.length) {
+        $button = $('<div>', {
+            id: 'icb_input_translate', class: 'interactable', role: 'button', tabindex: 0,
+            title: '입력창 번역', 'aria-label': '입력창 번역',
+        }).append($('<i>', { class: 'fa-graphite fa-thin fa-language', 'aria-hidden': 'true' }));
+        $button.on('click.icb', event => {
+            event.preventDefault();
+            event.stopPropagation();
+            translateInput();
+        });
+        $button.on('keydown.icb', event => {
+            if (event.key === 'Enter' || event.key === ' ') {
+                event.preventDefault();
+                event.stopPropagation();
+                $button.trigger('click');
+            }
+        });
+        $send.before($button);
+    }
     $button.toggle(settings.enabled && settings.showInputTranslationButton);
 }
 
